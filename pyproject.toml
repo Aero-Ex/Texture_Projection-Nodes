@@ -1,6 +1,5 @@
 [project]
-name = "
-Texture_Projection-Nodes"
+name = "Texture_Projection-Nodes"
 description = "Custom Nodes for ComfyUI to Projects Texture into your 3D models."
 version = "0.1.0"
 license = "MIT"
