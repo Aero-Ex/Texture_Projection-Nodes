@@ -9,6 +9,28 @@ from .Texture_Projection.Renderer.DifferentiableRenderer.MeshRender import MeshR
 from .Texture_Projection.Texture_Projection_utils.pipeline_utils import ViewProcessor
 from .Texture_Projection.Renderer.DifferentiableRenderer.mesh_utils import convert_obj_to_glb
 
+def resolve_mesh_path(p):
+    if p is None: return p
+    if isinstance(p, list) and len(p) > 0: p = p[0]
+    if not isinstance(p, str):
+        if type(p).__name__ == "File3D":
+            if hasattr(p, "get_source") and isinstance(p.get_source(), str): p = p.get_source()
+            elif hasattr(p, "save_to"):
+                import folder_paths
+                tmp = os.path.join(folder_paths.get_temp_directory(), f"mesh_{os.urandom(4).hex()}.glb")
+                return p.save_to(tmp)
+            elif hasattr(p, "_source") and isinstance(p._source, str): p = p._source
+        if hasattr(p, "export"):
+            import folder_paths
+            tmp = os.path.join(folder_paths.get_temp_directory(), f"mesh_{os.urandom(4).hex()}.glb")
+            p.export(tmp, file_type="glb")
+            return tmp
+        if isinstance(p, dict): return resolve_mesh_path(p.get("mesh") or p.get("glb_path") or p.get("path") or p)
+    if not isinstance(p, str): return p
+    import folder_paths
+    pts = [p] + [os.path.join(getattr(folder_paths, f"get_{d}_directory")(), p) for d in ("input", "output", "temp")]
+    return next((os.path.abspath(x) for x in pts if os.path.exists(x)), p)
+
 class Texture_ProjectionRenderConditions:
     """
     renders Normal, CCM, and Mask images from a 3D mesh using the local Grid renderer.
@@ -35,6 +57,9 @@ class Texture_ProjectionRenderConditions:
                 "render_rgb_hdri": (["true", "false"], {"default": "false"}),
                 "lighting_mode": (["hdri", "uniform_ambient"], {"default": "hdri"}),
                 "lighting_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            },
+            "optional": {
+                "mesh": ("*",),
             }
         }
 
@@ -43,7 +68,8 @@ class Texture_ProjectionRenderConditions:
     FUNCTION = "render"
     CATEGORY = "Texture_Projection/Render"
 
-    def render(self, mesh_path, resolution, camera_type, camera_distance, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity):
+    def render(self, mesh_path, resolution, camera_type, camera_distance, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity, mesh=None):
+        mesh_path = resolve_mesh_path(mesh if mesh is not None else mesh_path)
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Mesh not found at: {mesh_path}")
 
@@ -124,6 +150,9 @@ class Texture_ProjectionBakeTextures:
                 "output_dir": ("STRING", {"default": "output/baked"}),
                 "debug_overlay": (["disable", "enable"], {"default": "disable"}),
             },
+            "optional": {
+                "mesh": ("*",),
+            }
         }
     
     RETURN_TYPES = ("STRING", "IMAGE", "IMAGE")
@@ -131,10 +160,17 @@ class Texture_ProjectionBakeTextures:
     FUNCTION = "bake"
     CATEGORY = "Texture_Projection/Bake"
 
-    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distance, geometry_scale, camera_elevations, camera_azimuths, output_dir, debug_overlay):
+    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distance, geometry_scale, camera_elevations, camera_azimuths, output_dir, debug_overlay, mesh=None):
+        mesh_path = resolve_mesh_path(mesh if mesh is not None else mesh_path)
+        
         import sys
-        # Convert to absolute paths
-        output_dir = os.path.abspath(output_dir)
+        import folder_paths
+        # Use ComfyUI's official output directory as the base
+        output_base = folder_paths.get_output_directory()
+        if not os.path.isabs(output_dir):
+            output_dir = os.path.join(output_base, output_dir)
+        
+        mesh_path = resolve_mesh_path(mesh_path)
         mesh_path = os.path.abspath(mesh_path)
         
         os.makedirs(output_dir, exist_ok=True)
@@ -264,6 +300,14 @@ class Texture_ProjectionBakeTextures:
         else:
             verif_batch = torch.zeros((1, 512, 512, 3))
             
+        # Return path relative to output directory for UI compatibility
+        try:
+            rel_glb_path = os.path.relpath(glb_path, output_base)
+            if not rel_glb_path.startswith(".."):
+                glb_path = rel_glb_path
+        except:
+            pass
+            
         return (glb_path, out_tex, verif_batch)
 
 class Texture_ProjectionMeshDirectoryLoader:
@@ -283,6 +327,7 @@ class Texture_ProjectionMeshDirectoryLoader:
 
     def load_directory(self, directory_path):
         import glob
+        directory_path = resolve_mesh_path(directory_path)
         if not os.path.exists(directory_path) or not os.path.isdir(directory_path):
             print(f"Texture_ProjectionMeshDirectoryLoader: Directory not found - {directory_path}")
             return ([],)
@@ -327,6 +372,7 @@ class Texture_ProjectionBatchDatasetGenerator:
         import glob
         import gc
         import sys
+        directory_path = resolve_mesh_path(directory_path)
         if not os.path.exists(directory_path):
             print(f"Texture_ProjectionBatchDatasetGenerator: Path not found - {directory_path}")
             return ("Path not found",)
