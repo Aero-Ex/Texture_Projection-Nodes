@@ -1,0 +1,4 @@
+# ninja log v7
+1	20227	1777134657011475445	/home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/build/temp.linux-x86_64-cpython-311/lib/custom_rasterizer_kernel/rasterizer.o	94d3f64943f99b14
+0	20623	1777134657010475462	/home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/build/temp.linux-x86_64-cpython-311/lib/custom_rasterizer_kernel/grid_neighbor.o	65e4d638b4c63ce9
+1	31539	1777134657011873945	/home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/build/temp.linux-x86_64-cpython-311/lib/custom_rasterizer_kernel/rasterizer_gpu.o	7ad8301559e3ad4

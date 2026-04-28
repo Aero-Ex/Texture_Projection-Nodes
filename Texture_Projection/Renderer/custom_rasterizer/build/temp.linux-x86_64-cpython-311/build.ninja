@@ -1,0 +1,39 @@
+ninja_required_version = 1.3
+cxx = c++
+nvcc = /opt/cuda/bin/nvcc
+
+cflags = -DNDEBUG -g -fwrapv -O3 -Wall -march=x86-64 -mtune=generic -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection -fno-semantic-interposition -ffat-lto-objects -march=x86-64 -mtune=generic -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection -fno-semantic-interposition -march=x86-64 -mtune=generic -O3 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection -fno-semantic-interposition -fPIC -I/home/aero/comfyvenv/lib/python3.11/site-packages/torch/include -I/home/aero/comfyvenv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/opt/cuda/include -I/home/aero/comfyvenv/include -I/usr/include/python3.11 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=custom_rasterizer_kernel -std=c++17
+cuda_cflags = -I/home/aero/comfyvenv/lib/python3.11/site-packages/torch/include -I/home/aero/comfyvenv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/opt/cuda/include -I/home/aero/comfyvenv/include -I/usr/include/python3.11 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=custom_rasterizer_kernel -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 -std=c++17
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc -MD -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+
+
+build /home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/build/temp.linux-x86_64-cpython-311/lib/custom_rasterizer_kernel/grid_neighbor.o: compile /home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/lib/custom_rasterizer_kernel/grid_neighbor.cpp
+build /home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/build/temp.linux-x86_64-cpython-311/lib/custom_rasterizer_kernel/rasterizer.o: compile /home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
+build /home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/build/temp.linux-x86_64-cpython-311/lib/custom_rasterizer_kernel/rasterizer_gpu.o: cuda_compile /home/aero/comfy/ComfyUI/custom_nodes/GridComposite/grid/Renderer/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_gpu.cu
+
+
+
+
+
+
+
+
