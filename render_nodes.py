@@ -220,6 +220,14 @@ class Texture_ProjectionBakeTextures:
             mesh = mesh.dump(concatenate=True)
             if isinstance(mesh, list): mesh = mesh[0]
             
+        # Ensure UVs are loaded (trimesh often fails for GLB without materials)
+        if not hasattr(mesh.visual, 'uv') or mesh.visual.uv is None:
+            from .Texture_Projection.Renderer.DifferentiableRenderer.mesh_utils import load_mesh as load_mesh_utils
+            _, _, vtx_uv, _, _ = load_mesh_utils(mesh_path)
+            if vtx_uv is not None:
+                # If it's a SimpleVisuals/ColorVisuals, convert to TextureVisuals
+                mesh.visual = trimesh.visual.texture.TextureVisuals(uv=vtx_uv)
+            
         # Explicitly apply NVDiffrast scale_to_bbox behavior to keep Renderer/Baker geometries structurally matched
         vertices = mesh.vertices
         bbox_min = vertices.min(axis=0)

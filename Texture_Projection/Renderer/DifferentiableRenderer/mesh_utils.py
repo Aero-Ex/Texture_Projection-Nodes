@@ -23,17 +23,50 @@ def _convert_to_numpy(data: Any, dtype: np.dtype) -> Optional[np.ndarray]:
     return np.asarray(data, dtype=dtype)
 
 def load_mesh(mesh):
+    vtx_pos, pos_idx, vtx_uv, uv_idx = None, None, None, None
     if isinstance(mesh, str):
+        mesh_path = os.path.abspath(mesh)
         import trimesh
-        mesh = trimesh.load(mesh)
-        if isinstance(mesh, trimesh.Scene):
-            mesh = mesh.dump(concatenate=True)
-            if isinstance(mesh, list): mesh = mesh[0]
-    
-    vtx_pos = _safe_extract_attribute(mesh, "vertices")
-    pos_idx = _safe_extract_attribute(mesh, "faces")
-    vtx_uv = _safe_extract_attribute(mesh, "visual.uv")
-    uv_idx = pos_idx
+        # Use process=False to avoid stripping data
+        m = trimesh.load(mesh_path, process=False)
+        if isinstance(m, trimesh.Scene):
+            m = m.to_geometry()
+        
+        vtx_pos = _safe_extract_attribute(m, "vertices")
+        pos_idx = _safe_extract_attribute(m, "faces")
+        vtx_uv = _safe_extract_attribute(m, "visual.uv")
+        
+        # If trimesh fails to find UVs in a GLB, try pygltflib
+        if vtx_uv is None and mesh_path.lower().endswith(('.glb', '.gltf')):
+            try:
+                import pygltflib
+                gltf = pygltflib.GLTF2().load(mesh_path)
+                for g_mesh in gltf.meshes:
+                    for primitive in g_mesh.primitives:
+                        if primitive.attributes.TEXCOORD_0 is not None:
+                            accessor = gltf.accessors[primitive.attributes.TEXCOORD_0]
+                            bv = gltf.bufferViews[accessor.bufferView]
+                            buffer = gltf.buffers[bv.buffer]
+                            raw_data = gltf.decode_data(buffer.uri) if buffer.uri else gltf.binary_blob()
+                            
+                            start = bv.byteOffset + (accessor.byteOffset or 0)
+                            end = start + accessor.count * 8
+                            
+                            vtx_uv = np.frombuffer(raw_data[start:end], dtype=np.float32).reshape(-1, 2).copy()
+                            uv_idx = pos_idx if vtx_uv.shape[0] == vtx_pos.shape[0] else None
+                            break
+                    if vtx_uv is not None: break
+            except Exception as e:
+                print(f"pygltflib UV extraction failed: {e}")
+
+        if vtx_uv is None and hasattr(m, 'vertex_attributes'):
+            vtx_uv = m.vertex_attributes.get('texcoord') or m.vertex_attributes.get('uv')
+    else:
+        vtx_pos = _safe_extract_attribute(mesh, "vertices")
+        pos_idx = _safe_extract_attribute(mesh, "faces")
+        vtx_uv = _safe_extract_attribute(mesh, "visual.uv")
+
+    uv_idx = pos_idx if (vtx_uv is not None and uv_idx is None) else uv_idx
     
     vtx_pos = _convert_to_numpy(vtx_pos, np.float32)
     pos_idx = _convert_to_numpy(pos_idx, np.int32)
