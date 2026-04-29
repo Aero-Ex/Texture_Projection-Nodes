@@ -198,6 +198,12 @@ class MeshRender:
         self.camera_distance = camera_distance
         self.use_antialias = use_antialias
         self.max_mip_level = max_mip_level
+        self.tex_position = None
+        self.tex_normal = None
+        self.tex_grid = None
+        self.texture_indices = None
+        self.vtx_uv = None
+        self.uv_idx = None
         self.filter_mode = filter_mode
         self.bake_angle_thres = 75
         self.set_boundary_unreliable_scale(2)
@@ -368,7 +374,7 @@ class MeshRender:
             self.mesh_normalize_scale_center = center.unsqueeze(0).cpu().numpy()
         else:
             self.scale_factor, self.mesh_normalize_scale_factor, self.mesh_normalize_scale_center = 1.0, 1.0, np.array([[0, 0, 0]])
-        if uv_idx is not None: self.extract_textiles()
+        if self.vtx_uv is not None: self.extract_textiles()
 
     def set_texture(self, tex, force_set=False):
         self.tex = _convert_texture_format(tex, self.texture_size, self.device, force_set)
@@ -417,6 +423,9 @@ class MeshRender:
         return self.tex_normalMap.cpu().numpy() if hasattr(self, "tex_normalMap") else None
 
     def extract_textiles(self):
+        if self.vtx_uv is None:
+            print("MeshRender: No UV data available to extract textiles.")
+            return
         vnum = self.vtx_uv.shape[0]
         vtx_uv_ext = torch.cat((self.vtx_uv, torch.zeros_like(self.vtx_uv[:, 0:1]), torch.ones_like(self.vtx_uv[:, 0:1])), axis=1)
         vtx_uv_ext = vtx_uv_ext.view(1, vnum, 4) * 2 - 1
@@ -525,6 +534,8 @@ class MeshRender:
         
         method = self.bake_mode if method is None else method
         if method == "back_sample":
+            if self.tex_position is None:
+                raise RuntimeError("Texture_Projection Error: Attempting to bake/back_project on a mesh with no UV data or uninitialized textiles. Please ensure your mesh has UV coordinates.")
             img_proj = torch.tensor([[proj[0,0],0,0,0],[0,proj[1,1],0,0],[0,0,1,0],[0,0,0,1]], device=self.device)
             w2c = torch.from_numpy(r_mv).to(self.device)
             v_proj = self.tex_position @ w2c.T @ img_proj
