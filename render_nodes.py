@@ -49,7 +49,7 @@ class Texture_ProjectionRenderConditions:
                 "mesh_path": ("STRING", {"default": "tests/case_1/mesh.obj"}),
                 "resolution": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 256}),
                 "camera_type": (["orth", "perspective"], {"default": "orth"}),
-                "camera_distance": ("FLOAT", {"default": 2.8, "min": 1.0, "max": 10.0, "step": 0.001}),
+                "camera_distances": ("STRING", {"default": "2.8, 2.8, 2.8, 2.8, 2.8, 2.8"}),
                 "geometry_scale": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.001}),
                 "camera_elevations": ("STRING", {"default": "20, 20, 20, 20, -20, -20"}),
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 330, 30"}),
@@ -68,7 +68,7 @@ class Texture_ProjectionRenderConditions:
     FUNCTION = "render"
     CATEGORY = "Texture_Projection/Render"
 
-    def render(self, mesh_path, resolution, camera_type, camera_distance, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity, mesh=None):
+    def render(self, mesh_path, resolution, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity, mesh=None):
         mesh_path = resolve_mesh_path(mesh if mesh is not None else mesh_path)
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Mesh not found at: {mesh_path}")
@@ -82,12 +82,22 @@ class Texture_ProjectionRenderConditions:
         try:
             cam_elevs = [float(x.strip()) for x in camera_elevations.split(",")]
             cam_azims = [float(x.strip()) for x in camera_azimuths.split(",")]
+            cam_dists = [float(x.strip()) for x in camera_distances.split(",")]
+            
+            # Pad or truncate cam_dists to match cam_elevs length
+            if len(cam_dists) == 1:
+                cam_dists = cam_dists * len(cam_elevs)
+            elif len(cam_dists) < len(cam_elevs):
+                cam_dists = cam_dists + [cam_dists[-1]] * (len(cam_elevs) - len(cam_dists))
+            elif len(cam_dists) > len(cam_elevs):
+                cam_dists = cam_dists[:len(cam_elevs)]
+                
         except Exception as e:
             print(f"Texture_Projection Error: Failed to parse camera parameters - {e}")
             sys.stdout.flush()
             raise e
             
-        c2ws = generate_orbit_views_c2ws_from_elev_azim(radius=camera_distance, elevation=cam_elevs, azimuth=cam_azims)
+        c2ws = generate_orbit_views_c2ws_from_elev_azim(radius=cam_dists, elevation=cam_elevs, azimuth=cam_azims)
 
         video_exporter = self.get_exporter()
         
@@ -143,7 +153,7 @@ class Texture_ProjectionBakeTextures:
                 "image_batch": ("IMAGE",),
                 "bake_size": ("INT", {"default": 1024, "min": 256, "max": 4096}),
                 "camera_type": (["orth", "perspective"], {"default": "orth"}),
-                "camera_distance": ("FLOAT", {"default": 2.8, "min": 1.0, "max": 10.0, "step": 0.001}),
+                "camera_distances": ("STRING", {"default": "2.8, 2.8, 2.8, 2.8, 2.8, 2.8"}),
                 "geometry_scale": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.001}),
                 "camera_elevations": ("STRING", {"default": "20, 20, 20, 20, -20, -20"}),
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 330, 30"}),
@@ -160,8 +170,13 @@ class Texture_ProjectionBakeTextures:
     FUNCTION = "bake"
     CATEGORY = "Texture_Projection/Bake"
 
-    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distance, geometry_scale, camera_elevations, camera_azimuths, output_dir, debug_overlay, mesh=None):
-        mesh_path = resolve_mesh_path(mesh if mesh is not None else mesh_path)
+    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, output_dir, debug_overlay, mesh=None):
+        # Unwrap original_mesh to avoid unnecessary serialization to disk and loss of UVs
+        original_mesh = mesh
+        if isinstance(original_mesh, list) and len(original_mesh) > 0: original_mesh = original_mesh[0]
+        if isinstance(original_mesh, dict): original_mesh = original_mesh.get("mesh") or original_mesh.get("glb_path") or original_mesh.get("path") or original_mesh
+
+        mesh_path_resolved = resolve_mesh_path(mesh if mesh is not None else mesh_path)
         
         import sys
         import folder_paths
@@ -170,8 +185,8 @@ class Texture_ProjectionBakeTextures:
         if not os.path.isabs(output_dir):
             output_dir = os.path.join(output_base, output_dir)
         
-        mesh_path = resolve_mesh_path(mesh_path)
-        mesh_path = os.path.abspath(mesh_path)
+        mesh_path_resolved = resolve_mesh_path(mesh_path_resolved)
+        mesh_path_resolved = os.path.abspath(mesh_path_resolved)
         
         os.makedirs(output_dir, exist_ok=True)
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -185,6 +200,16 @@ class Texture_ProjectionBakeTextures:
         try:
             cam_elevs = [float(x.strip()) for x in camera_elevations.split(",")]
             cam_azims = [float(x.strip()) for x in camera_azimuths.split(",")]
+            cam_dists = [float(x.strip()) for x in camera_distances.split(",")]
+            
+            # Pad or truncate cam_dists to match cam_elevs length
+            if len(cam_dists) == 1:
+                cam_dists = cam_dists * len(cam_elevs)
+            elif len(cam_dists) < len(cam_elevs):
+                cam_dists = cam_dists + [cam_dists[-1]] * (len(cam_elevs) - len(cam_dists))
+            elif len(cam_dists) > len(cam_elevs):
+                cam_dists = cam_dists[:len(cam_elevs)]
+                
             # Standard Grid weights/exp
             cam_weights = [1.0] * len(cam_elevs)
             if len(cam_weights) >= 6:
@@ -197,7 +222,7 @@ class Texture_ProjectionBakeTextures:
         # 1. Initialize Renderer and Processor
         renderer = MeshRender(
             default_resolution=bake_size,
-            camera_distance=camera_distance,
+            camera_distance=cam_dists[0],
             camera_type=camera_type,
             texture_size=bake_size,
             bake_mode="back_sample",
@@ -210,20 +235,28 @@ class Texture_ProjectionBakeTextures:
         view_processor = ViewProcessor(render=renderer)
         
         # 2. Load Mesh
-        if not os.path.exists(mesh_path):
-            print(f"Texture_Projection Error: Mesh not found at {mesh_path}")
-            sys.stdout.flush()
-            return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)))
-            
-        mesh = trimesh.load(mesh_path)
-        if isinstance(mesh, trimesh.Scene):
-            mesh = mesh.dump(concatenate=True)
-            if isinstance(mesh, list): mesh = mesh[0]
+        # Use the original passed-in mesh if possible, otherwise load from path
+        if original_mesh is not None and hasattr(original_mesh, "vertices") and hasattr(original_mesh, "faces"):
+            mesh = original_mesh
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+                if isinstance(mesh, list): mesh = mesh[0]
+        else:
+            if not os.path.exists(mesh_path_resolved):
+                print(f"Texture_Projection Error: Mesh not found at {mesh_path_resolved}")
+                sys.stdout.flush()
+                return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)))
+                
+            mesh = trimesh.load(mesh_path_resolved)
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+                if isinstance(mesh, list): mesh = mesh[0]
             
         # Ensure UVs are loaded (trimesh often fails for GLB without materials)
         if not hasattr(mesh.visual, 'uv') or mesh.visual.uv is None:
             from .Texture_Projection.Renderer.DifferentiableRenderer.mesh_utils import load_mesh as load_mesh_utils
-            _, _, vtx_uv, _, _ = load_mesh_utils(mesh_path)
+            source_for_uvs = mesh_path_resolved if (original_mesh is None or not hasattr(original_mesh, "vertices")) else original_mesh
+            _, _, vtx_uv, _, _ = load_mesh_utils(source_for_uvs)
             if vtx_uv is not None:
                 # If it's a SimpleVisuals/ColorVisuals, convert to TextureVisuals
                 mesh.visual = trimesh.visual.texture.TextureVisuals(uv=vtx_uv)
@@ -258,24 +291,24 @@ class Texture_ProjectionBakeTextures:
         textures, cos_maps = [], []
         verif_images = []
         
-        for i, (img, elev, azim, weight) in enumerate(zip(input_images, cam_elevs, cam_azims, cam_weights)):
+        for i, (img, elev, azim, dist, weight) in enumerate(zip(input_images, cam_elevs, cam_azims, cam_dists, cam_weights)):
             img_resized = img.resize((bake_size, bake_size))
-            tex, cos, _ = renderer.back_project(img_resized, elev, azim)
+            tex, cos, _ = renderer.back_project(img_resized, elev, azim, camera_distance=dist)
             textures.append(tex)
             cos_maps.append(weight * (cos ** 4.0))
             
             if debug_overlay == "enable":
                 # Use input image resolution for verification overlay
                 v_h, v_w = image_batch.shape[1], image_batch.shape[2]
-                norm_render = renderer.render_normal(elev, azim, resolution=(v_h, v_w), return_type="th")
-                alpha_mask = renderer.render_alpha(elev, azim, resolution=(v_h, v_w), return_type="th")
+                norm_render = renderer.render_normal(elev, azim, camera_distance=dist, resolution=(v_h, v_w), return_type="th")
+                alpha_mask = renderer.render_alpha(elev, azim, camera_distance=dist, resolution=(v_h, v_w), return_type="th")
                 
                 # Ensure they are [H, W, C]
                 if norm_render.dim() == 4: norm_render = norm_render.squeeze(0)
                 if alpha_mask.dim() == 4: alpha_mask = alpha_mask.squeeze(0)
                 
-                bg_img = img_tensor[idx, ..., :3].to(device)
-                overlay = bg_img * (1.0 - alpha_mask * 0.5) + norm_render * (alpha_mask * 0.5)
+                # Combine RGB from normal render and Alpha from alpha_mask to create RGBA
+                overlay = torch.cat((norm_render, alpha_mask), dim=-1)
                 verif_images.append(overlay.cpu())
 
         texture, trust_map = renderer.fast_bake_texture(textures, cos_maps)
@@ -359,7 +392,7 @@ class Texture_ProjectionBatchDatasetGenerator:
                 "output_dir": ("STRING", {"default": "output/dataset"}),
                 "resolution": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 256}),
                 "camera_type": (["orth", "perspective"], {"default": "orth"}),
-                "camera_distance": ("FLOAT", {"default": 2.8, "min": 1.0, "max": 10.0, "step": 0.001}),
+                "camera_distances": ("STRING", {"default": "2.8, 2.8, 2.8, 2.8, 2.8, 2.8"}),
                 "geometry_scale": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.001}),
                 "camera_elevations": ("STRING", {"default": "20, 20, 20, 20, -20, -20"}),
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 330, 30"}),
@@ -376,7 +409,7 @@ class Texture_ProjectionBatchDatasetGenerator:
     FUNCTION = "generate_dataset"
     CATEGORY = "Texture_Projection/Dataset"
 
-    def generate_dataset(self, directory_path, output_dir, resolution, camera_type, camera_distance, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity):
+    def generate_dataset(self, directory_path, output_dir, resolution, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity):
         import glob
         import gc
         import sys
@@ -422,7 +455,7 @@ class Texture_ProjectionBatchDatasetGenerator:
                     mesh_path=mesh_path,
                     resolution=resolution,
                     camera_type=camera_type,
-                    camera_distance=camera_distance,
+                    camera_distances=camera_distances,
                     geometry_scale=geometry_scale,
                     camera_elevations=camera_elevations,
                     camera_azimuths=camera_azimuths,

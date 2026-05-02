@@ -1,7 +1,7 @@
 import math
 import torch
 import numpy as np
-from typing import List
+from typing import List, Union
 from .rotation import euler_angles_to_matrix
 
 def lookat_to_matrix(lookat:torch.Tensor) -> torch.Tensor:
@@ -92,9 +92,13 @@ def sample_point_on_sphere(radius: float, theta: torch.Tensor, phi: torch.Tensor
     x, y, z = z, x, y
     return x, y, z
 
-def generate_orbit_views_c2ws_from_elev_azim(radius: float = 2.0, elevation: List[float] = None, azimuth: List[float] = None):
+def generate_orbit_views_c2ws_from_elev_azim(radius: Union[float, List[float]] = 2.0, elevation: List[float] = None, azimuth: List[float] = None):
     ele = torch.deg2rad(torch.as_tensor(elevation, dtype=torch.float32))
     azi = torch.deg2rad(torch.as_tensor(azimuth, dtype=torch.float32))
+    
+    if isinstance(radius, (list, tuple)):
+        radius = torch.as_tensor(radius, dtype=torch.float32)
+    
     x, y, z = sample_point_on_sphere(radius, theta=azi, phi=ele)
     xyz = torch.stack([x, y, z], dim=-1)
     c2ws = lookat_to_matrix_fixed(xyz)
