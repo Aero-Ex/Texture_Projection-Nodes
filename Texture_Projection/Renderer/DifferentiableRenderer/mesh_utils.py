@@ -132,11 +132,67 @@ def save_obj_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic
 def save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=None, roughness=None, normal=None):
     save_obj_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic, roughness, normal)
 
+def save_glb_mesh(glb_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=None, roughness=None, normal=None):
+    import trimesh
+    from trimesh.visual.material import PBRMaterial
+    from PIL import Image
+    try:
+        glb_path = os.path.abspath(glb_path)
+        os.makedirs(os.path.dirname(glb_path), exist_ok=True)
+        
+        # Unroll vertices/UVs if UV indices differ from vertex position indices (UV seams)
+        if uv_idx is not None and (len(vtx_uv) != len(vtx_pos) or not np.array_equal(pos_idx, uv_idx)):
+            flat_pos = pos_idx.flatten()
+            flat_uv = uv_idx.flatten()
+            vertices = vtx_pos[flat_pos]
+            uvs = vtx_uv[flat_uv]
+            faces = np.arange(len(vertices), dtype=np.int32).reshape(-1, 3)
+        else:
+            vertices = vtx_pos
+            uvs = vtx_uv
+            faces = pos_idx
+            
+        h, w = texture.shape[0], texture.shape[1]
+        base_color_img = Image.fromarray((np.clip(texture, 0, 1) * 255).astype(np.uint8)).convert("RGBA")
+        
+        material_kwargs = {
+            "name": "Material",
+            "baseColorTexture": base_color_img,
+            "metallicFactor": 1.0,
+            "roughnessFactor": 1.0,
+        }
+        
+        if metallic is not None or roughness is not None:
+            r_img = Image.fromarray((np.clip(roughness[..., 0], 0, 1) * 255).astype(np.uint8)).resize((w, h)) if roughness is not None else Image.new("L", (w, h), 128)
+            m_img = Image.fromarray((np.clip(metallic[..., 0], 0, 1) * 255).astype(np.uint8)).resize((w, h)) if metallic is not None else Image.new("L", (w, h), 0)
+            ao_img = Image.new("L", (w, h), 255)
+            mr_img = Image.merge("RGB", (ao_img, r_img, m_img))
+            material_kwargs["metallicRoughnessTexture"] = mr_img
+            
+        if normal is not None:
+            norm_img = Image.fromarray((np.clip(normal, 0, 1) * 255).astype(np.uint8)).resize((w, h))
+            material_kwargs["normalTexture"] = norm_img
+            
+        pbr_mat = PBRMaterial(**material_kwargs)
+        
+        visual = trimesh.visual.TextureVisuals(uv=uvs, material=pbr_mat)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=visual, process=False)
+        
+        mesh.export(glb_path, file_type='glb')
+        return os.path.exists(glb_path)
+    except Exception as e:
+        print(f"GLB Error (in-memory): {e}")
+        import sys
+        sys.stdout.flush()
+        return False
+
 def convert_obj_to_glb(obj_path, glb_path, shade_type="SMOOTH", auto_smooth_angle=60, merge_vertices=False):
     import trimesh
+    from PIL import Image
     try:
         obj_path = os.path.abspath(obj_path)
         glb_path = os.path.abspath(glb_path)
+        base_path = os.path.splitext(obj_path)[0]
         print(f"GLB Debug: Using trimesh to convert {obj_path}")
         
         # Load mesh with trimesh
@@ -147,6 +203,53 @@ def convert_obj_to_glb(obj_path, glb_path, shade_type="SMOOTH", auto_smooth_angl
             # If it's a scene, we might want to merge it or just export the whole thing
             # For Grid, it's usually a single mesh
             print("GLB Debug: Mesh loaded as Scene, exporting...")
+        
+        # Check if PBR maps (metallic, roughness, normal) exist
+        diffuse_img_path = f"{base_path}.jpg"
+        metallic_img_path = f"{base_path}_metallic.jpg"
+        roughness_img_path = f"{base_path}_roughness.jpg"
+        normal_img_path = f"{base_path}_normal.jpg"
+        
+        if os.path.exists(metallic_img_path) or os.path.exists(roughness_img_path) or os.path.exists(normal_img_path):
+            try:
+                from trimesh.visual.material import PBRMaterial
+                
+                base_color_img = Image.open(diffuse_img_path).convert("RGBA") if os.path.exists(diffuse_img_path) else None
+                w, h = (base_color_img.size if base_color_img else (1024, 1024))
+                
+                # GLTF PBR standard: Green = Roughness, Blue = Metallic, Red = Occlusion (255)
+                if os.path.exists(roughness_img_path):
+                    r_img = Image.open(roughness_img_path).convert("L").resize((w, h))
+                else:
+                    r_img = Image.new("L", (w, h), 128)
+                    
+                if os.path.exists(metallic_img_path):
+                    m_img = Image.open(metallic_img_path).convert("L").resize((w, h))
+                else:
+                    m_img = Image.new("L", (w, h), 0)
+                    
+                ao_img = Image.new("L", (w, h), 255)
+                mr_img = Image.merge("RGB", (ao_img, r_img, m_img))
+                
+                norm_img = Image.open(normal_img_path).convert("RGB").resize((w, h)) if os.path.exists(normal_img_path) else None
+                
+                pbr_mat = PBRMaterial(
+                    name="Material",
+                    baseColorTexture=base_color_img,
+                    metallicRoughnessTexture=mr_img,
+                    normalTexture=norm_img,
+                    metallicFactor=1.0,
+                    roughnessFactor=1.0,
+                )
+                
+                if isinstance(mesh, trimesh.Scene):
+                    for geom in mesh.geometry.values():
+                        if hasattr(geom, 'visual') and hasattr(geom.visual, 'uv') and geom.visual.uv is not None:
+                            geom.visual.material = pbr_mat
+                elif hasattr(mesh, 'visual'):
+                    mesh.visual.material = pbr_mat
+            except Exception as pe:
+                print(f"GLB PBR Material creation warning: {pe}")
         
         # Apply smoothing if requested
         if shade_type == "SMOOTH" or shade_type == "AUTO_SMOOTH":

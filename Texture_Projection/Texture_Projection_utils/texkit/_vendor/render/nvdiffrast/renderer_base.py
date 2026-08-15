@@ -155,7 +155,9 @@ class NVDiffRendererBase(nn.Module):
                 camera_position = dr.antialias(camera_position, rast, v_pos_clip, t_pos_idx)
             out.update({"camera_position": camera_position})
 
-        if kwargs.get('render_map_kd', False) and kwargs.get('map_kd') is not None:
+        if (kwargs.get('render_map_kd', False) and kwargs.get('map_kd') is not None and
+                hasattr(mesh, 'v_tex') and mesh.v_tex is not None and
+                hasattr(mesh, 't_tex_idx') and mesh.t_tex_idx is not None):
             v_tex_ndc = mesh.v_tex * 2.0 - 1.0
             t_tex_idx = mesh.t_tex_idx.to(torch.int32)
             gb_uv, _ = dr.interpolate(v_tex_ndc, rast, t_tex_idx)
@@ -167,7 +169,9 @@ class NVDiffRendererBase(nn.Module):
                 sampled_kd = dr.antialias(sampled_kd, rast, v_pos_clip, t_pos_idx)
             out.update({"map_kd": sampled_kd})
 
-        if kwargs.get('render_map_ks', False) and kwargs.get('map_ks') is not None:
+        if (kwargs.get('render_map_ks', False) and kwargs.get('map_ks') is not None and
+                hasattr(mesh, 'v_tex') and mesh.v_tex is not None and
+                hasattr(mesh, 't_tex_idx') and mesh.t_tex_idx is not None):
             v_tex_ndc = mesh.v_tex * 2.0 - 1.0
             t_tex_idx = mesh.t_tex_idx.to(torch.int32)
             gb_uv, _ = dr.interpolate(v_tex_ndc, rast, t_tex_idx)

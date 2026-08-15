@@ -53,22 +53,18 @@ class Texture_ProjectionRenderConditions:
                 "geometry_scale": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.001}),
                 "camera_elevations": ("STRING", {"default": "20, 20, 20, 20, -20, -20"}),
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 330, 30"}),
-                "hdri_path": ("STRING", {"default": "/home/aero/Desktop/stuttgart_hillside_4k.exr"}),
-                "render_rgb_hdri": (["true", "false"], {"default": "false"}),
-                "lighting_mode": (["hdri", "uniform_ambient"], {"default": "hdri"}),
-                "lighting_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
             },
             "optional": {
                 "mesh": ("*",),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "STRING")
-    RETURN_NAMES = ("normal_batch", "normal_bump_batch", "ccm_batch", "mask_batch", "rgb_batch", "albedo_batch", "roughness_batch", "metallic_batch", "mesh_name")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("normal_batch", "normal_bump_batch", "ccm_batch", "mask_batch", "albedo_batch", "roughness_batch", "metallic_batch", "mesh_name")
     FUNCTION = "render"
     CATEGORY = "Texture_Projection/Render"
 
-    def render(self, mesh_path, resolution, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity, mesh=None):
+    def render(self, mesh_path, resolution, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, mesh=None):
         mesh_path = resolve_mesh_path(mesh if mesh is not None else mesh_path)
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Mesh not found at: {mesh_path}")
@@ -103,10 +99,6 @@ class Texture_ProjectionRenderConditions:
         
         out = video_exporter.export_condition(
             mesh_path,
-            hdri_path=hdri_path,
-            render_rgb_hdri=render_rgb_hdri,
-            lighting_mode=lighting_mode,
-            lighting_intensity=lighting_intensity,
             geometry_scale=geometry_scale,
             H=resolution,
             W=resolution,
@@ -136,13 +128,7 @@ class Texture_ProjectionRenderConditions:
              roughness_batch = torch.zeros((len(cam_elevs), resolution, resolution, 3))
              metallic_batch = torch.zeros((len(cam_elevs), resolution, resolution, 3))
 
-        # HDRI PBR Render Pass via PyTorch Deferred Shading
-        if render_rgb_hdri == "true":
-            rgb_batch = out_to_tensor(out.get('rgb'))
-        else:
-            rgb_batch = torch.zeros((len(cam_elevs), resolution, resolution, 3))
-
-        return (normal_batch, normal_bump_batch, ccm_batch, mask_batch, rgb_batch, albedo_batch, roughness_batch, metallic_batch, mesh_name)
+        return (normal_batch, normal_bump_batch, ccm_batch, mask_batch, albedo_batch, roughness_batch, metallic_batch, mesh_name)
 
 class Texture_ProjectionBakeTextures:
     @classmethod
@@ -157,20 +143,23 @@ class Texture_ProjectionBakeTextures:
                 "geometry_scale": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.001}),
                 "camera_elevations": ("STRING", {"default": "20, 20, 20, 20, -20, -20"}),
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 330, 30"}),
-                "output_dir": ("STRING", {"default": "output/baked"}),
+                "output_dir": ("STRING", {"default": "baked"}),
                 "debug_overlay": (["disable", "enable"], {"default": "disable"}),
             },
             "optional": {
                 "mesh": ("*",),
+                "roughness_batch": ("IMAGE",),
+                "metallic_batch": ("IMAGE",),
+                "normal_batch": ("IMAGE",),
             }
         }
     
-    RETURN_TYPES = ("STRING", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("glb_path", "texture_map", "verification_batch")
+    RETURN_TYPES = ("STRING", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("glb_path", "texture_map", "verification_batch", "roughness_map", "metallic_map", "normal_map")
     FUNCTION = "bake"
     CATEGORY = "Texture_Projection/Bake"
 
-    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, output_dir, debug_overlay, mesh=None):
+    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, output_dir, debug_overlay, mesh=None, roughness_batch=None, metallic_batch=None, normal_batch=None):
         # Unwrap original_mesh to avoid unnecessary serialization to disk and loss of UVs
         original_mesh = mesh
         if isinstance(original_mesh, list) and len(original_mesh) > 0: original_mesh = original_mesh[0]
@@ -180,21 +169,37 @@ class Texture_ProjectionBakeTextures:
         
         import sys
         import folder_paths
-        # Use ComfyUI's official output directory as the base
+        
         output_base = folder_paths.get_output_directory()
-        if not os.path.isabs(output_dir):
-            output_dir = os.path.join(output_base, output_dir)
+        
+        # Clean prefix: handle cases where user passed "output/baked", "baked", or custom subfolders/stems
+        prefix = output_dir.strip() if output_dir else "baked"
+        if not os.path.isabs(prefix):
+            # Strip redundant leading 'output/' if user supplied it
+            if prefix.startswith("output/") or prefix.startswith("output\\"):
+                prefix = prefix[7:]
+            # Ensure filename stem is present if only folder was specified
+            if not os.path.basename(prefix):
+                prefix = os.path.join(prefix, "textured_mesh")
+            elif not os.path.splitext(prefix)[1] and not prefix.endswith("_mesh") and not prefix.endswith("textured_mesh"):
+                prefix = os.path.join(prefix, "textured_mesh")
+        
+        # Use official ComfyUI get_save_image_path for safe paths and incrementing non-overwriting counters
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(prefix, output_base)
+        os.makedirs(full_output_folder, exist_ok=True)
+        
+        file_basename = f"{filename}_{counter:05}_"
+        glb_path = os.path.join(full_output_folder, f"{file_basename}.glb")
         
         mesh_path_resolved = resolve_mesh_path(mesh_path_resolved)
         mesh_path_resolved = os.path.abspath(mesh_path_resolved)
         
-        os.makedirs(output_dir, exist_ok=True)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         
         if image_batch is None or image_batch.shape[0] == 0:
             print("Texture_Projection Error: Empty image batch.")
             sys.stdout.flush()
-            return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)))
+            return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)), torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, bake_size, bake_size, 3)))
 
         # Parse camera parameters
         try:
@@ -217,7 +222,7 @@ class Texture_ProjectionBakeTextures:
         except Exception as e:
             print(f"Texture_Projection Error: Failed to parse camera parameters - {e}")
             sys.stdout.flush()
-            return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)))
+            return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)), torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, bake_size, bake_size, 3)))
 
         # 1. Initialize Renderer and Processor
         renderer = MeshRender(
@@ -245,7 +250,7 @@ class Texture_ProjectionBakeTextures:
             if not os.path.exists(mesh_path_resolved):
                 print(f"Texture_Projection Error: Mesh not found at {mesh_path_resolved}")
                 sys.stdout.flush()
-                return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)))
+                return ("", torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, 512, 512, 3)), torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, bake_size, bake_size, 3)), torch.zeros((1, bake_size, bake_size, 3)))
                 
             mesh = trimesh.load(mesh_path_resolved)
             if isinstance(mesh, trimesh.Scene):
@@ -274,21 +279,30 @@ class Texture_ProjectionBakeTextures:
         renderer.load_mesh(mesh=mesh, auto_center=False)
 
         # 3. Process Images
-        input_images = []
-        batch_size = image_batch.shape[0]
         num_views = len(cam_elevs)
-        
-        for i in range(num_views):
-            idx = min(i, batch_size - 1)
-            img_tensor = image_batch[idx] # [H, W, C]
-            
-            # Simple RGB conversion (removing the automatic masking as requested)
-            img_np = (img_tensor[..., :3].cpu().numpy() * 255).astype(np.uint8)
-            img = Image.fromarray(img_np).convert("RGB")
-            input_images.append(img)
+
+        def prepare_input_images(batch):
+            if batch is None or batch.shape[0] == 0:
+                return None
+            imgs = []
+            b_size = batch.shape[0]
+            for i in range(num_views):
+                idx = min(i, b_size - 1)
+                img_tensor = batch[idx]
+                img_np = (img_tensor[..., :3].cpu().numpy() * 255).astype(np.uint8)
+                imgs.append(Image.fromarray(img_np).convert("RGB"))
+            return imgs
+
+        input_images = prepare_input_images(image_batch)
+        input_roughness = prepare_input_images(roughness_batch)
+        input_metallic = prepare_input_images(metallic_batch)
+        input_normal = prepare_input_images(normal_batch)
         
         # 4. Bake and Stitch + Verification
         textures, cos_maps = [], []
+        roughness_textures = [] if input_roughness is not None else None
+        metallic_textures = [] if input_metallic is not None else None
+        normal_textures = [] if input_normal is not None else None
         verif_images = []
         
         for i, (img, elev, azim, dist, weight) in enumerate(zip(input_images, cam_elevs, cam_azims, cam_dists, cam_weights)):
@@ -296,6 +310,21 @@ class Texture_ProjectionBakeTextures:
             tex, cos, _ = renderer.back_project(img_resized, elev, azim, camera_distance=dist)
             textures.append(tex)
             cos_maps.append(weight * (cos ** 4.0))
+
+            if input_roughness is not None:
+                r_img_resized = input_roughness[i].resize((bake_size, bake_size))
+                r_tex, _, _ = renderer.back_project(r_img_resized, elev, azim, camera_distance=dist)
+                roughness_textures.append(r_tex)
+
+            if input_metallic is not None:
+                m_img_resized = input_metallic[i].resize((bake_size, bake_size))
+                m_tex, _, _ = renderer.back_project(m_img_resized, elev, azim, camera_distance=dist)
+                metallic_textures.append(m_tex)
+
+            if input_normal is not None:
+                n_img_resized = input_normal[i].resize((bake_size, bake_size))
+                n_tex, _, _ = renderer.back_project(n_img_resized, elev, azim, camera_distance=dist)
+                normal_textures.append(n_tex)
             
             if debug_overlay == "enable":
                 # Use input image resolution for verification overlay
@@ -314,28 +343,45 @@ class Texture_ProjectionBakeTextures:
         texture, trust_map = renderer.fast_bake_texture(textures, cos_maps)
         
         # 5. Inpaint
-        mask_np = (trust_map.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
-        texture = view_processor.texture_inpaint(texture, mask_np)
-        
-        # 6. Save and Convert
+        texture = view_processor.texture_inpaint(texture, trust_map)
         renderer.set_texture(texture, force_set=True)
-        obj_path = os.path.join(output_dir, "textured_mesh.obj")
-        print(f"Texture_Projection: Exporting OBJ to {obj_path}")
-        renderer.save_mesh(obj_path, downsample=False)
+
+        roughness_texture = None
+        if roughness_textures is not None:
+            r_baked, _ = renderer.fast_bake_texture(roughness_textures, cos_maps)
+            roughness_texture = view_processor.texture_inpaint(r_baked, trust_map)
+
+        metallic_texture = None
+        if metallic_textures is not None:
+            m_baked, _ = renderer.fast_bake_texture(metallic_textures, cos_maps)
+            metallic_texture = view_processor.texture_inpaint(m_baked, trust_map)
+
+        normal_texture = None
+        if normal_textures is not None:
+            n_baked, _ = renderer.fast_bake_texture(normal_textures, cos_maps)
+            normal_texture = view_processor.texture_inpaint(n_baked, trust_map)
+            renderer.set_texture_normal(normal_texture, force_set=True)
+
+        # Set metallic/roughness to renderer if present
+        if roughness_texture is not None or metallic_texture is not None:
+            # Channel 0: metallic, Channel 1: roughness
+            m_chan = metallic_texture[..., 0:1] if metallic_texture is not None else torch.zeros((bake_size, bake_size, 1), device=device)
+            r_chan = roughness_texture[..., 0:1] if roughness_texture is not None else torch.full((bake_size, bake_size, 1), 0.5, device=device)
+            tex_mr = torch.cat([m_chan, r_chan, torch.ones_like(m_chan)], dim=-1)
+            renderer.set_texture_mr(tex_mr, force_set=True)
         
-        glb_path = obj_path.replace(".obj", ".glb")
-        print(f"Texture_Projection: Converting to GLB via trimesh...")
-        success = convert_obj_to_glb(obj_path, glb_path)
-        
-        if success and os.path.exists(glb_path):
-            print(f"Texture_Projection: GLB SAVED SUCCESSFULLY: {glb_path}")
-        else:
-            print(f"Texture_Projection Error: GLB conversion failed.")
-        
+        # 6. Save directly to GLB
+        success = renderer.save_glb(glb_path, downsample=False)
+        if not success or not os.path.exists(glb_path):
+            print(f"Texture_Projection Error: GLB export failed.")
         sys.stdout.flush()
             
         # Format outputs
         out_tex = texture.cpu().unsqueeze(0) # [1, H, W, C]
+        out_roughness = roughness_texture.cpu().unsqueeze(0) if roughness_texture is not None else torch.full((1, bake_size, bake_size, 3), 0.5)
+        out_metallic = metallic_texture.cpu().unsqueeze(0) if metallic_texture is not None else torch.zeros((1, bake_size, bake_size, 3))
+        out_normal = normal_texture.cpu().unsqueeze(0) if normal_texture is not None else torch.tensor([0.5, 0.5, 1.0]).view(1, 1, 1, 3).repeat(1, bake_size, bake_size, 1)
+
         if len(verif_images) > 0:
             verif_batch = torch.stack(verif_images) # [B, 512, 512, 3]
         else:
@@ -349,7 +395,7 @@ class Texture_ProjectionBakeTextures:
         except:
             pass
             
-        return (glb_path, out_tex, verif_batch)
+        return (glb_path, out_tex, verif_batch, out_roughness, out_metallic, out_normal)
 
 class Texture_ProjectionMeshDirectoryLoader:
     @classmethod
@@ -396,10 +442,6 @@ class Texture_ProjectionBatchDatasetGenerator:
                 "geometry_scale": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.001}),
                 "camera_elevations": ("STRING", {"default": "20, 20, 20, 20, -20, -20"}),
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 330, 30"}),
-                "hdri_path": ("STRING", {"default": "/home/aero/Desktop/stuttgart_hillside_4k.exr"}),
-                "render_rgb_hdri": (["true", "false"], {"default": "false"}),
-                "lighting_mode": (["hdri", "uniform_ambient"], {"default": "hdri"}),
-                "lighting_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
             }
         }
     
@@ -409,7 +451,7 @@ class Texture_ProjectionBatchDatasetGenerator:
     FUNCTION = "generate_dataset"
     CATEGORY = "Texture_Projection/Dataset"
 
-    def generate_dataset(self, directory_path, output_dir, resolution, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, hdri_path, render_rgb_hdri, lighting_mode, lighting_intensity):
+    def generate_dataset(self, directory_path, output_dir, resolution, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths):
         import glob
         import gc
         import sys
@@ -459,14 +501,10 @@ class Texture_ProjectionBatchDatasetGenerator:
                     geometry_scale=geometry_scale,
                     camera_elevations=camera_elevations,
                     camera_azimuths=camera_azimuths,
-                    hdri_path=hdri_path, 
-                    render_rgb_hdri=render_rgb_hdri,
-                    lighting_mode=lighting_mode,
-                    lighting_intensity=lighting_intensity
                 )
                 
                 # Unpack the new return tuple
-                normals, bumps, ccms, masks, rgbs, albedos, roughness, metallic, mesh_name = outs
+                normals, bumps, ccms, masks, albedos, roughness, metallic, mesh_name = outs
                 
                 saver_node.save_dataset(
                     output_dir=output_dir,
@@ -475,14 +513,13 @@ class Texture_ProjectionBatchDatasetGenerator:
                     normal_bump_batch=bumps,
                     ccm_batch=ccms,
                     mask_batch=masks,
-                    rgb_batch=rgbs,
                     albedo_batch=albedos,
                     roughness_batch=roughness,
                     metallic_batch=metallic
                 )
                 
                 # Protect VRAM aggressively
-                del outs, normals, bumps, ccms, masks, rgbs, albedos, roughness, metallic
+                del outs, normals, bumps, ccms, masks, albedos, roughness, metallic
                 gc.collect()
                 torch.cuda.empty_cache()
                 
@@ -503,7 +540,6 @@ class Texture_ProjectionDatasetSaver:
                 "normal_bump_batch": ("IMAGE",),
                 "ccm_batch": ("IMAGE",),
                 "mask_batch": ("IMAGE",),
-                "rgb_batch": ("IMAGE",),
                 "albedo_batch": ("IMAGE",),
                 "roughness_batch": ("IMAGE",),
                 "metallic_batch": ("IMAGE",),
@@ -516,7 +552,7 @@ class Texture_ProjectionDatasetSaver:
     FUNCTION = "save_dataset"
     CATEGORY = "Texture_Projection/Dataset"
 
-    def save_dataset(self, output_dir, prefix, normal_batch, normal_bump_batch, ccm_batch, mask_batch, rgb_batch, albedo_batch, roughness_batch, metallic_batch):
+    def save_dataset(self, output_dir, prefix, normal_batch, normal_bump_batch, ccm_batch, mask_batch, albedo_batch, roughness_batch, metallic_batch):
         out_path = os.path.abspath(os.path.join(output_dir, prefix))
         os.makedirs(out_path, exist_ok=True)
 
@@ -525,7 +561,6 @@ class Texture_ProjectionDatasetSaver:
             "normal_bump": normal_bump_batch,
             "ccm": ccm_batch,
             "mask": mask_batch,
-            "rgb": rgb_batch,
             "albedo": albedo_batch,
             "roughness": roughness_batch,
             "metallic": metallic_batch,
