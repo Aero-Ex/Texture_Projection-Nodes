@@ -27,7 +27,7 @@ from .camera_utils import (
 )
 
 try:
-    from .mesh_utils import load_mesh, save_mesh
+    from .mesh_utils import load_mesh, save_mesh, save_glb_mesh
 except ImportError:
     print("Bpy IO CAN NOT BE Imported!!!")
 
@@ -353,6 +353,18 @@ class MeshRender:
             if texture_normal is not None: texture_normal = cv2.resize(texture_normal, (texture_normal.shape[1]//2, texture_normal.shape[0]//2))
         save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture_data, metallic=texture_metallic, roughness=texture_roughness, normal=texture_normal)
 
+    def save_glb(self, glb_path, downsample=False):
+        vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh(normalize=False)
+        texture_data = self.get_texture()
+        texture_metallic, texture_roughness = self.get_texture_mr()
+        texture_normal = self.get_texture_normal()
+        if downsample:
+            texture_data = cv2.resize(texture_data, (texture_data.shape[1]//2, texture_data.shape[0]//2))
+            if texture_metallic is not None: texture_metallic = cv2.resize(texture_metallic, (texture_metallic.shape[1]//2, texture_metallic.shape[0]//2))
+            if texture_roughness is not None: texture_roughness = cv2.resize(texture_roughness, (texture_roughness.shape[1]//2, texture_roughness.shape[0]//2))
+            if texture_normal is not None: texture_normal = cv2.resize(texture_normal, (texture_normal.shape[1]//2, texture_normal.shape[0]//2))
+        return save_glb_mesh(glb_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture_data, metallic=texture_metallic, roughness=texture_roughness, normal=texture_normal)
+
     def set_mesh(self, vtx_pos, pos_idx, vtx_uv=None, uv_idx=None, scale_factor=1.15, auto_center=True):
         self.vtx_pos = torch.from_numpy(vtx_pos).to(self.device).float()
         self.pos_idx = torch.from_numpy(pos_idx).to(self.device).int()
@@ -570,22 +582,94 @@ class MeshRender:
         return texture_merge / torch.clamp(trust_map_merge, min=1e-8), trust_map_merge > 1e-8
 
     @torch.no_grad()
-    def uv_inpaint(self, texture, mask, vertex_inpaint=True, method="NS", return_float=False):
-        if isinstance(texture, torch.Tensor): texture_np = texture.cpu().numpy()
-        else: texture_np = texture
-        if isinstance(mask, torch.Tensor): mask = (mask.squeeze(-1).cpu().numpy()*255).astype(np.uint8)
+    def _fast_gpu_inpaint(self, texture: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Fast GPU-accelerated multi-scale UV seam dilation and background filling.
+        Replaces slow single-threaded CPU cv2.inpaint (NS/Telea).
+        """
+        if mask.all():
+            return texture
+
+        H, W = texture.shape[:2]
+        C = texture.shape[-1]
         
+        # [1, C, H, W]
+        tex = texture.permute(2, 0, 1).unsqueeze(0).contiguous()
+        m = (mask > 0).permute(2, 0, 1).unsqueeze(0).float().contiguous()
+
+        # Step 1: 16-iteration fast seam boundary dilation (fills UV chart edges with nearest valid color)
+        kernel = torch.ones((1, 1, 3, 3), device=tex.device, dtype=tex.dtype)
+        kernel_c = torch.ones((C, 1, 3, 3), device=tex.device, dtype=tex.dtype)
+        
+        for _ in range(16):
+            if m.all():
+                break
+            valid_neighbors = F.conv2d(m, kernel, padding=1)
+            sum_neighbors = F.conv2d(tex * m, kernel_c, padding=1, groups=C)
+            avg_neighbors = sum_neighbors / torch.clamp(valid_neighbors, min=1e-5)
+            update_mask = (m == 0) & (valid_neighbors > 0)
+            tex = torch.where(update_mask, avg_neighbors, tex)
+            m = torch.where(update_mask, torch.ones_like(m), m)
+
+        # Step 2: If there are still large untextured background areas, fill via fast downsample pyramid
+        if not m.all():
+            small_tex = F.interpolate(tex, size=(max(16, H // 8), max(16, W // 8)), mode="bilinear", align_corners=False)
+            small_m = F.interpolate(m, size=(max(16, H // 8), max(16, W // 8)), mode="nearest")
+            for _ in range(8):
+                if small_m.all(): break
+                v_nb = F.conv2d(small_m, kernel, padding=1)
+                s_nb = F.conv2d(small_tex * small_m, kernel_c, padding=1, groups=C)
+                avg_nb = s_nb / torch.clamp(v_nb, min=1e-5)
+                up_m = (small_m == 0) & (v_nb > 0)
+                small_tex = torch.where(up_m, avg_nb, small_tex)
+                small_m = torch.where(up_m, torch.ones_like(small_m), small_m)
+            
+            fill_tex = F.interpolate(small_tex, size=(H, W), mode="bilinear", align_corners=False)
+            tex = torch.where(m == 0, fill_tex, tex)
+
+        return tex.squeeze(0).permute(1, 2, 0).contiguous()
+
+    @torch.no_grad()
+    def uv_inpaint(self, texture, mask, vertex_inpaint=False, method="GPU", return_float=False):
+        if isinstance(texture, np.ndarray):
+            tex_tensor = torch.from_numpy(texture).to(self.device).float()
+            if tex_tensor.max() > 1.0: tex_tensor = tex_tensor / 255.0
+        elif isinstance(texture, torch.Tensor):
+            tex_tensor = texture.to(self.device).float()
+            if tex_tensor.max() > 1.0: tex_tensor = tex_tensor / 255.0
+        else:
+            tex_tensor = texture
+            
+        if isinstance(mask, np.ndarray):
+            mask_tensor = torch.from_numpy(mask).to(self.device).float()
+        elif isinstance(mask, torch.Tensor):
+            mask_tensor = mask.to(self.device).float()
+        else:
+            mask_tensor = mask
+
+        if mask_tensor.dim() == 2:
+            mask_tensor = mask_tensor.unsqueeze(-1)
+        if mask_tensor.max() > 1.0:
+            mask_tensor = (mask_tensor > 128).float()
+        else:
+            mask_tensor = (mask_tensor > 0.5).float()
+
         if vertex_inpaint and INPAINT_AVAILABLE:
-            verbose = False
             try:
                 vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
-                texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+                tex_np = (tex_tensor.cpu().numpy() * 255).astype(np.uint8)
+                m_np = (mask_tensor.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
+                tex_np, m_np = meshVerticeInpaint(tex_np, m_np, vtx_pos, vtx_uv, pos_idx, uv_idx)
+                tex_tensor = torch.from_numpy(tex_np / 255.0).to(self.device).float()
+                mask_tensor = torch.from_numpy((m_np > 128).astype(np.float32)).to(self.device).unsqueeze(-1)
             except Exception as e:
-                print(f"InPaint Error: {e}")
-                
-        if method == "NS":
-            texture_np = cv2.inpaint((texture_np*255).astype(np.uint8), 255-mask, 3, cv2.INPAINT_NS)
-        return texture_np
+                pass
+
+        tex_tensor = self._fast_gpu_inpaint(tex_tensor, mask_tensor)
+        
+        if return_float:
+            return tex_tensor
+        return (tex_tensor.cpu().numpy() * 255).astype(np.uint8)
 
     def _sample_texture_grid(self, uv_coords: torch.Tensor) -> torch.Tensor:
         tex = self.tex.permute(2,0,1).unsqueeze(0)

@@ -85,9 +85,8 @@ class ViewProcessor:
 
     def texture_inpaint(self, texture, mask, mask_gray=None, default=None):
         if default is not None:
-            mask_bool = mask.astype(bool)
+            mask_bool = mask.astype(bool) if isinstance(mask, np.ndarray) else mask.bool()
             texture[~mask_bool] = torch.tensor(default, dtype=texture.dtype, device=texture.device)
+            return texture
         else:
-            texture_np = self.render.uv_inpaint(texture, mask)
-            texture = torch.from_numpy(texture_np / 255.0).float().to(texture.device)
-        return texture
+            return self.render.uv_inpaint(texture, mask, return_float=True)
