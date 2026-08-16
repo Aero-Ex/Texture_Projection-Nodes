@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import numpy as np
 from PIL import Image
@@ -618,9 +619,205 @@ class Texture_ProjectionDatasetSaver:
             
         return (out_path,)
 
+class Texture_ProjectionHighToLowBake:
+    """
+    Bakes geometric details (tangent-space normal map, height, AO) and PBR materials 
+    (diffuse, roughness, metallic) from a high-poly mesh onto an unwrapped low-poly mesh.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "high_poly_mesh_path": ("STRING", {"default": "tests/high_poly.glb"}),
+                "low_poly_mesh_path": ("STRING", {"default": "tests/low_poly.glb"}),
+                "bake_resolution": ([512, 1024, 2048, 4096], {"default": 2048}),
+                "ray_max_distance": ("FLOAT", {"default": 0.08, "min": 0.001, "max": 1.0, "step": 0.001}),
+                "cage_offset": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.2, "step": 0.001}),
+                "bake_diffuse": (["enable", "disable"], {"default": "enable"}),
+                "bake_normal": (["enable", "disable"], {"default": "enable"}),
+                "bake_roughness": (["enable", "disable"], {"default": "enable"}),
+                "bake_metallic": (["enable", "disable"], {"default": "enable"}),
+                "bake_height": (["disable", "enable"], {"default": "disable"}),
+                "bake_ao": (["disable", "enable"], {"default": "disable"}),
+                "normal_format": (["OpenGL (Y+)", "DirectX (Y-)"], {"default": "OpenGL (Y+)"}),
+                "auto_align": (["enable", "disable"], {"default": "enable"}),
+                "output_dir": ("STRING", {"default": "baked_lowpoly"}),
+            },
+            "optional": {
+                "high_poly_mesh": ("*",),
+                "low_poly_mesh": ("*",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "MESH")
+    RETURN_NAMES = ("glb_path", "diffuse_map", "normal_map", "roughness_map", "metallic_map", "height_map", "ao_map", "low_poly_mesh")
+    FUNCTION = "bake"
+    CATEGORY = "Texture_Projection"
+
+    def bake(self, high_poly_mesh_path, low_poly_mesh_path, bake_resolution, ray_max_distance, cage_offset,
+             bake_diffuse, bake_normal, bake_roughness, bake_metallic, bake_height, bake_ao, normal_format,
+             output_dir="baked_lowpoly", auto_align="enable", high_poly_mesh=None, low_poly_mesh=None):
+        
+        import folder_paths
+        from .high_to_low_baker import bake_high_to_low_poly
+        from .Texture_Projection.Renderer.DifferentiableRenderer.mesh_utils import save_glb_mesh, load_mesh as load_mesh_utils
+
+        # 1. Resolve High-Poly Mesh
+        if isinstance(high_poly_mesh, list) and len(high_poly_mesh) > 0: high_poly_mesh = high_poly_mesh[0]
+        if isinstance(high_poly_mesh, dict): high_poly_mesh = high_poly_mesh.get("mesh") or high_poly_mesh.get("glb_path") or high_poly_mesh.get("path") or high_poly_mesh
+        high_path_resolved = resolve_mesh_path(high_poly_mesh if high_poly_mesh is not None else high_poly_mesh_path)
+
+        if high_poly_mesh is not None and hasattr(high_poly_mesh, "vertices") and hasattr(high_poly_mesh, "faces"):
+            high_mesh = high_poly_mesh
+        else:
+            if not os.path.exists(high_path_resolved):
+                raise FileNotFoundError(f"High-poly mesh not found: {high_path_resolved}")
+            high_mesh = trimesh.load(high_path_resolved)
+            if isinstance(high_mesh, trimesh.Scene):
+                high_mesh = high_mesh.dump(concatenate=True)
+                if isinstance(high_mesh, list): high_mesh = high_mesh[0]
+
+        # 2. Resolve Low-Poly Mesh
+        if isinstance(low_poly_mesh, list) and len(low_poly_mesh) > 0: low_poly_mesh = low_poly_mesh[0]
+        if isinstance(low_poly_mesh, dict): low_poly_mesh = low_poly_mesh.get("mesh") or low_poly_mesh.get("glb_path") or low_poly_mesh.get("path") or low_poly_mesh
+        low_path_resolved = resolve_mesh_path(low_poly_mesh if low_poly_mesh is not None else low_poly_mesh_path)
+
+        if low_poly_mesh is not None and hasattr(low_poly_mesh, "vertices") and hasattr(low_poly_mesh, "faces"):
+            low_mesh = low_poly_mesh
+        else:
+            if not os.path.exists(low_path_resolved):
+                raise FileNotFoundError(f"Low-poly mesh not found: {low_path_resolved}")
+            low_mesh = trimesh.load(low_path_resolved)
+            if isinstance(low_mesh, trimesh.Scene):
+                low_mesh = low_mesh.dump(concatenate=True)
+                if isinstance(low_mesh, list): low_mesh = low_mesh[0]
+
+        # Ensure Low-Poly UVs are present
+        if not hasattr(low_mesh.visual, 'uv') or low_mesh.visual.uv is None:
+            source_for_uvs = low_path_resolved if (low_poly_mesh is None or not hasattr(low_poly_mesh, "vertices")) else low_poly_mesh
+            _, _, vtx_uv, _, _ = load_mesh_utils(source_for_uvs)
+            if vtx_uv is not None:
+                low_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=vtx_uv)
+            else:
+                raise ValueError("Low-poly mesh has no UV coordinates. Please unwrap UVs before baking.")
+
+        # Compute smooth vertex normals on low_mesh to ensure continuous organic shading
+        low_mesh.fix_normals()
+        low_mesh.vertex_normals = trimesh.geometry.mean_vertex_normals(
+            vertex_count=len(low_mesh.vertices),
+            faces=low_mesh.faces,
+            face_normals=low_mesh.face_normals
+        )
+
+        # Auto-align low-poly geometry to match high-poly bounding box & centroid
+        if auto_align == "enable":
+            h_min, h_max = high_mesh.bounds[0], high_mesh.bounds[1]
+            l_min, l_max = low_mesh.bounds[0], low_mesh.bounds[1]
+            h_center = (h_min + h_max) / 2.0
+            l_center = (l_min + l_max) / 2.0
+            h_ext = np.maximum(h_max - h_min, 1e-6)
+            l_ext = np.maximum(l_max - l_min, 1e-6)
+            scale_xyz = h_ext / l_ext
+            low_mesh = low_mesh.copy()
+            low_mesh.vertices = (low_mesh.vertices - l_center) * scale_xyz + h_center
+
+        # 3. Setup output paths via native ComfyUI folder_paths
+        output_base = folder_paths.get_output_directory()
+        prefix = output_dir.strip() if output_dir else "baked_lowpoly"
+        if not os.path.isabs(prefix):
+            if prefix.startswith("output/") or prefix.startswith("output\\"):
+                prefix = prefix[7:]
+            if not os.path.basename(prefix):
+                prefix = os.path.join(prefix, "lowpoly_baked")
+            elif not os.path.splitext(prefix)[1] and not prefix.endswith("_baked") and not prefix.endswith("lowpoly_baked"):
+                prefix = os.path.join(prefix, "lowpoly_baked")
+
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(prefix, output_base)
+        os.makedirs(full_output_folder, exist_ok=True)
+        file_basename = f"{filename}_{counter:05}_"
+        glb_path = os.path.join(full_output_folder, f"{file_basename}.glb")
+
+        import time
+        t_start = time.perf_counter()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # 4. Execute High-to-Low Poly Baking Engine
+        baked_maps = bake_high_to_low_poly(
+            high_mesh=high_mesh,
+            low_mesh=low_mesh,
+            resolution=bake_resolution,
+            ray_max_dist=ray_max_distance,
+            cage_offset=cage_offset,
+            bake_diffuse=(bake_diffuse == "enable"),
+            bake_normal=(bake_normal == "enable"),
+            bake_roughness=(bake_roughness == "enable"),
+            bake_metallic=(bake_metallic == "enable"),
+            bake_height=(bake_height == "enable"),
+            bake_ao=(bake_ao == "enable"),
+            normal_format=normal_format,
+            device=device
+        )
+
+        diffuse_np = baked_maps["diffuse"]
+        normal_np = baked_maps["normal"]
+        roughness_np = baked_maps["roughness"]
+        metallic_np = baked_maps["metallic"]
+        height_np = baked_maps["height"]
+        ao_np = baked_maps["ao"]
+
+        # 5. Export Low-Poly PBR GLB
+        vtx_pos = np.asarray(low_mesh.vertices, dtype=np.float32)
+        pos_idx = np.asarray(low_mesh.faces, dtype=np.int32)
+        vtx_uv = np.asarray(low_mesh.visual.uv, dtype=np.float32)
+        uv_idx = pos_idx
+
+        success = save_glb_mesh(
+            glb_path,
+            vtx_pos,
+            pos_idx,
+            vtx_uv,
+            uv_idx,
+            diffuse_np,
+            metallic=metallic_np,
+            roughness=roughness_np,
+            normal=normal_np if bake_normal == "enable" else None
+        )
+
+        if not success or not os.path.exists(glb_path):
+            print(f"Texture_ProjectionHighToLowBake Error: Failed to save GLB to {glb_path}")
+        else:
+            print(f"[HighToLow Baker] Complete! Saved GLB to {glb_path} (Total time: {time.perf_counter() - t_start:.2f}s)")
+        sys.stdout.flush()
+
+        # Format image outputs for ComfyUI [1, H, W, C]
+        def to_image_tensor(arr):
+            if arr.ndim == 2:
+                arr = np.repeat(arr[..., None], 3, axis=-1)
+            elif arr.shape[-1] == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            return torch.from_numpy(arr).unsqueeze(0).float()
+
+        out_diffuse_th = to_image_tensor(diffuse_np)
+        out_normal_th = to_image_tensor(normal_np)
+        out_roughness_th = to_image_tensor(roughness_np)
+        out_metallic_th = to_image_tensor(metallic_np)
+        out_height_th = to_image_tensor(height_np)
+        out_ao_th = to_image_tensor(ao_np)
+
+        # Relative path for UI
+        try:
+            rel_glb_path = os.path.relpath(glb_path, output_base)
+            if not rel_glb_path.startswith(".."):
+                glb_path = rel_glb_path
+        except:
+            pass
+
+        return (glb_path, out_diffuse_th, out_normal_th, out_roughness_th, out_metallic_th, out_height_th, out_ao_th, low_mesh)
+
 NODE_CLASS_MAPPINGS = {
     "Texture_ProjectionRenderConditions": Texture_ProjectionRenderConditions,
     "Texture_ProjectionBakeTextures": Texture_ProjectionBakeTextures,
+    "Texture_ProjectionHighToLowBake": Texture_ProjectionHighToLowBake,
     "Texture_ProjectionDatasetSaver": Texture_ProjectionDatasetSaver,
     "Texture_ProjectionMeshDirectoryLoader": Texture_ProjectionMeshDirectoryLoader,
     "Texture_ProjectionBatchDatasetGenerator": Texture_ProjectionBatchDatasetGenerator,
@@ -629,7 +826,9 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Texture_ProjectionRenderConditions": "Texture_Projection Render Conditions",
     "Texture_ProjectionBakeTextures": "Texture_Projection Bake Textures",
+    "Texture_ProjectionHighToLowBake": "Texture_Projection High-to-Low Poly Baker",
     "Texture_ProjectionDatasetSaver": "Texture_Projection Dataset Saver",
     "Texture_ProjectionMeshDirectoryLoader": "Texture_Projection Mesh Directory Loader",
     "Texture_ProjectionBatchDatasetGenerator": "Texture_Projection Batch Dataset Generator",
 }
+
