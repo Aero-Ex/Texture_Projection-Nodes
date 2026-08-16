@@ -145,6 +145,7 @@ class Texture_ProjectionBakeTextures:
                 "camera_elevations": ("STRING", {"default": "20, 20, 20, 20, -20, -20"}),
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 330, 30"}),
                 "output_dir": ("STRING", {"default": "baked"}),
+                "blending_sharpness": (["sharp (cos^8)", "ultra_sharp (cos^16)", "smooth (cos^4)"], {"default": "sharp (cos^8)"}),
                 "debug_overlay": (["disable", "enable"], {"default": "disable"}),
             },
             "optional": {
@@ -160,7 +161,7 @@ class Texture_ProjectionBakeTextures:
     FUNCTION = "bake"
     CATEGORY = "Texture_Projection/Bake"
 
-    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, output_dir, debug_overlay, mesh=None, roughness_batch=None, metallic_batch=None, normal_batch=None):
+    def bake(self, mesh_path, image_batch, bake_size, camera_type, camera_distances, geometry_scale, camera_elevations, camera_azimuths, output_dir, blending_sharpness="sharp (cos^8)", debug_overlay="disable", mesh=None, roughness_batch=None, metallic_batch=None, normal_batch=None):
         # Unwrap original_mesh to avoid unnecessary serialization to disk and loss of UVs
         original_mesh = mesh
         if isinstance(original_mesh, list) and len(original_mesh) > 0: original_mesh = original_mesh[0]
@@ -258,6 +259,16 @@ class Texture_ProjectionBakeTextures:
                 mesh = mesh.dump(concatenate=True)
                 if isinstance(mesh, list): mesh = mesh[0]
             
+        # Auto-detect and fix inside-out meshes (where normals point inward towards centroid)
+        if hasattr(mesh, "vertices") and hasattr(mesh, "faces") and len(mesh.faces) > 0:
+            v_cent = mesh.vertices.mean(axis=0)
+            out_vec = mesh.vertices - v_cent
+            dot = np.sum(mesh.vertex_normals * out_vec, axis=1)
+            if (dot < 0).mean() > 0.6:
+                print(f"[Texture_Projection] Warning: Mesh was detected as INSIDE-OUT (inverted normals). Auto-flipping outward...")
+                mesh.faces = mesh.faces[:, [0, 2, 1]]
+                mesh.vertex_normals = None
+
         # Ensure UVs are loaded (trimesh often fails for GLB without materials)
         if not hasattr(mesh.visual, 'uv') or mesh.visual.uv is None:
             from .Texture_Projection.Renderer.DifferentiableRenderer.mesh_utils import load_mesh as load_mesh_utils
@@ -306,11 +317,19 @@ class Texture_ProjectionBakeTextures:
         normal_textures = [] if input_normal is not None else None
         verif_images = []
         
+        # Resolve blending exponent based on blending_sharpness
+        if "ultra" in str(blending_sharpness).lower() or "16" in str(blending_sharpness):
+            blend_power = 16.0
+        elif "smooth" in str(blending_sharpness).lower() or "4" in str(blending_sharpness):
+            blend_power = 4.0
+        else:
+            blend_power = 8.0
+
         for i, (img, elev, azim, dist, weight) in enumerate(zip(input_images, cam_elevs, cam_azims, cam_dists, cam_weights)):
             img_resized = img.resize((bake_size, bake_size))
             tex, cos, _ = renderer.back_project(img_resized, elev, azim, camera_distance=dist)
             textures.append(tex)
-            cos_maps.append(weight * (cos ** 4.0))
+            cos_maps.append(weight * (cos ** blend_power))
 
             if input_roughness is not None:
                 r_img_resized = input_roughness[i].resize((bake_size, bake_size))
@@ -690,24 +709,27 @@ class Texture_ProjectionHighToLowBake:
             low_mesh = trimesh.load(low_path_resolved)
             if isinstance(low_mesh, trimesh.Scene):
                 low_mesh = low_mesh.dump(concatenate=True)
-                if isinstance(low_mesh, list): low_mesh = low_mesh[0]
+        # Auto-detect and fix inside-out meshes
+        if hasattr(low_mesh, "vertices") and hasattr(low_mesh.faces, "__len__") and len(low_mesh.faces) > 0:
+            v_cent = low_mesh.vertices.mean(axis=0)
+            out_vec = low_mesh.vertices - v_cent
+            dot = np.sum(low_mesh.vertex_normals * out_vec, axis=1)
+            if (dot < 0).mean() > 0.6:
+                print(f"[Texture_Projection] Warning: Low-poly mesh was detected as INSIDE-OUT. Auto-flipping outward...")
+                low_mesh.faces = low_mesh.faces[:, [0, 2, 1]]
+                low_mesh.vertex_normals = None
 
-        # Ensure Low-Poly UVs are present
-        if not hasattr(low_mesh.visual, 'uv') or low_mesh.visual.uv is None:
+        # Extract and preserve UVs across all operations
+        saved_uv = None
+        if hasattr(low_mesh, 'visual') and hasattr(low_mesh.visual, 'uv') and low_mesh.visual.uv is not None:
+            saved_uv = np.asarray(low_mesh.visual.uv, dtype=np.float32)
+        elif hasattr(low_mesh, 'vertex_attributes') and ('texcoord' in low_mesh.vertex_attributes or 'uv' in low_mesh.vertex_attributes):
+            saved_uv = np.asarray(low_mesh.vertex_attributes.get('texcoord') or low_mesh.vertex_attributes.get('uv'), dtype=np.float32)
+        else:
             source_for_uvs = low_path_resolved if (low_poly_mesh is None or not hasattr(low_poly_mesh, "vertices")) else low_poly_mesh
             _, _, vtx_uv, _, _ = load_mesh_utils(source_for_uvs)
             if vtx_uv is not None:
-                low_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=vtx_uv)
-            else:
-                raise ValueError("Low-poly mesh has no UV coordinates. Please unwrap UVs before baking.")
-
-        # Compute smooth vertex normals on low_mesh to ensure continuous organic shading
-        low_mesh.fix_normals()
-        low_mesh.vertex_normals = trimesh.geometry.mean_vertex_normals(
-            vertex_count=len(low_mesh.vertices),
-            faces=low_mesh.faces,
-            face_normals=low_mesh.face_normals
-        )
+                saved_uv = np.asarray(vtx_uv, dtype=np.float32)
 
         # Auto-align low-poly geometry to match high-poly bounding box & centroid
         if auto_align == "enable":
@@ -717,9 +739,25 @@ class Texture_ProjectionHighToLowBake:
             l_center = (l_min + l_max) / 2.0
             h_ext = np.maximum(h_max - h_min, 1e-6)
             l_ext = np.maximum(l_max - l_min, 1e-6)
-            scale_xyz = h_ext / l_ext
-            low_mesh = low_mesh.copy()
-            low_mesh.vertices = (low_mesh.vertices - l_center) * scale_xyz + h_center
+            # Use uniform isotropic scaling to avoid squishing facial features
+            scale_factor = float(np.median(h_ext / l_ext))
+            new_vertices = (low_mesh.vertices - l_center) * scale_factor + h_center
+            low_mesh = trimesh.Trimesh(
+                vertices=new_vertices,
+                faces=low_mesh.faces,
+                visual=trimesh.visual.texture.TextureVisuals(uv=saved_uv) if saved_uv is not None else None,
+                process=False
+            )
+        elif saved_uv is not None:
+            low_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=saved_uv)
+
+        # Compute smooth vertex normals on low_mesh to ensure continuous organic shading
+        low_mesh.fix_normals()
+        low_mesh.vertex_normals = trimesh.geometry.mean_vertex_normals(
+            vertex_count=len(low_mesh.vertices),
+            faces=low_mesh.faces,
+            face_normals=low_mesh.face_normals
+        )
 
         # 3. Setup output paths via native ComfyUI folder_paths
         output_base = folder_paths.get_output_directory()
