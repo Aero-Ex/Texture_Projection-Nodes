@@ -444,7 +444,7 @@ class MeshRender:
         rast_out, _ = self.raster_rasterize(vtx_uv_ext, self.uv_idx, resolution=self.texture_size)
         position, _ = self.raster_interpolate(self.vtx_pos, rast_out, self.pos_idx)
         v0, v1, v2 = self.vtx_pos[self.pos_idx[:, 0], :], self.vtx_pos[self.pos_idx[:, 1], :], self.vtx_pos[self.pos_idx[:, 2], :]
-        face_normals = F.normalize(torch.cross(v1 - v0, v2 - v0, dim=-1), dim=-1)
+        face_normals = F.normalize(torch.cross(v2 - v0, v1 - v0, dim=-1), dim=-1)
         vertex_normals = trimesh.geometry.mean_vertex_normals(vertex_count=self.vtx_pos.shape[0], faces=self.pos_idx.cpu(), face_normals=face_normals.cpu())
         vertex_normals = torch.from_numpy(vertex_normals).to(self.vtx_pos).contiguous()
         position_normal, _ = self.raster_interpolate(vertex_normals[None, ...], rast_out, self.pos_idx)
@@ -511,7 +511,7 @@ class MeshRender:
         pos_camera = pos_camera[:, :3] / pos_camera[:, 3:4]
         
         v0, v1, v2 = pos_camera[self.pos_idx[:, 0], :], pos_camera[self.pos_idx[:, 1], :], pos_camera[self.pos_idx[:, 2], :]
-        face_normals = F.normalize(torch.cross(v1 - v0, v2 - v0, dim=-1), dim=-1)
+        face_normals = F.normalize(torch.cross(v2 - v0, v1 - v0, dim=-1), dim=-1)
         
         rast_out, _ = self.raster_rasterize(pos_clip, self.pos_idx, resolution=resolution)
         visible_mask = torch.clamp(rast_out[..., -1:], 0, 1)[0, ...]
@@ -530,7 +530,7 @@ class MeshRender:
         depth_normalized = (depth - depth_m.min()) / (depth_m.max() - depth_m.min()) * visible_mask
         sketch_image = self.render_sketch_from_depth(depth_normalized)
         
-        lookat = torch.tensor([[0, 0, -1]], device=self.device)
+        lookat = torch.tensor([[0, 0, 1]], device=self.device).float()
         cos_image = torch.nn.functional.cosine_similarity(lookat, normal.view(-1, 3)).view(normal.shape[0], normal.shape[1], 1)
         cos_image[cos_image < np.cos(self.bake_angle_thres / 180 * np.pi)] = 0
         
@@ -555,7 +555,9 @@ class MeshRender:
             img_y = torch.clamp(((v_proj[:, 1].clamp(-1,1)*0.5+0.5)*resolution[1]).long(), 0, resolution[1]-1)
             indices = img_y * resolution[0] + img_x
             v_z = v_proj[:, 2]
-            valid_idx = torch.where((torch.abs(v_z - depth.reshape(-1)[indices]) < 3e-3) & (visible_mask.reshape(-1)[indices]*cos_image.reshape(-1)[indices]>0))[0]
+            c_dist = float(self.camera_distance if camera_distance is None else camera_distance)
+            depth_tol = max(3e-3, 0.008 * c_dist)
+            valid_idx = torch.where((torch.abs(v_z - depth.reshape(-1)[indices]) < depth_tol) & (visible_mask.reshape(-1)[indices]*cos_image.reshape(-1)[indices]>0))[0]
             indices, valid_idx = indices[valid_idx], valid_idx
             
             texture = torch.zeros(self.texture_size[0] * self.texture_size[1], channel, device=self.device)
@@ -652,7 +654,7 @@ class MeshRender:
         if mask_tensor.max() > 1.0:
             mask_tensor = (mask_tensor > 128).float()
         else:
-            mask_tensor = (mask_tensor > 0.5).float()
+            mask_tensor = (mask_tensor > 1e-4).float()
 
         if vertex_inpaint and INPAINT_AVAILABLE:
             try:

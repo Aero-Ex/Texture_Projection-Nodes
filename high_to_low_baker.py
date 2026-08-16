@@ -97,12 +97,24 @@ def rasterize_lowpoly_uv_space(low_mesh, resolution, device="cuda"):
     vtx_pos = np.asarray(low_mesh.vertices, dtype=np.float32)
     faces = np.asarray(low_mesh.faces, dtype=np.int32)
     
-    if hasattr(low_mesh.visual, 'uv') and low_mesh.visual.uv is not None:
+    # Robust UV extraction
+    vtx_uv = None
+    if hasattr(low_mesh, 'visual') and hasattr(low_mesh.visual, 'uv') and low_mesh.visual.uv is not None and len(low_mesh.visual.uv) > 0:
         vtx_uv = np.asarray(low_mesh.visual.uv, dtype=np.float32)
-        uv_faces = faces
-    else:
-        raise ValueError("Low-poly mesh must have UV coordinates for high-to-low baking.")
+    elif hasattr(low_mesh, 'vertex_attributes') and ('texcoord' in low_mesh.vertex_attributes or 'uv' in low_mesh.vertex_attributes):
+        vtx_uv = np.asarray(low_mesh.vertex_attributes.get('texcoord') or low_mesh.vertex_attributes.get('uv'), dtype=np.float32)
 
+    if vtx_uv is None or len(vtx_uv) == 0:
+        print("[HighToLow Baker] Low-poly mesh missing UV coordinates, auto-unwrapping with xatlas...")
+        import xatlas
+        vmapping, indices, uvs = xatlas.parametrize(vtx_pos, faces)
+        vtx_pos = vtx_pos[vmapping]
+        faces = indices.astype(np.int32)
+        vtx_uv = uvs.astype(np.float32)
+        # Update low_mesh in place
+        low_mesh = trimesh.Trimesh(vertices=vtx_pos, faces=faces, visual=trimesh.visual.texture.TextureVisuals(uv=vtx_uv), process=False)
+
+    uv_faces = faces
     normals = np.asarray(low_mesh.vertex_normals, dtype=np.float32)
     tangents, bitangents = compute_vertex_tangents(vtx_pos, normals, faces, vtx_uv, uv_faces)
 
@@ -495,12 +507,9 @@ def bake_high_to_low_poly(
                            bary[:, 1:2] * tri_norm[:, 1] +
                            bary[:, 2:3] * tri_norm[:, 2])
             norm_len = np.linalg.norm(interp_norm, axis=-1, keepdims=True)
-            norm_len[norm_len < 1e-8] = 1e-8
-            interp_norm = interp_norm / norm_len
-
-            # Backface rejection
+            # Backface rejection - only accept high-poly surfaces facing the same direction
             dot_align = np.sum(n_low[global_out_idx] * interp_norm, axis=-1)
-            valid_facing = dot_align > -0.1
+            valid_facing = dot_align > 0.05
 
             if np.any(valid_facing):
                 valid_out_idx = global_out_idx[valid_facing]
@@ -515,20 +524,30 @@ def bake_high_to_low_poly(
                                  bary[valid_facing, 2:3] * tri_uv[:, 2])
                     hit_uvs[valid_out_idx] = interp_uv
 
-    # 4. Fast spatial cKDTree query for any remaining missed texels
-    # Guarantees 100% full surface coverage without leaving unbaked holes or (0,0) fallback patches
+    # 4. Normal-aware spatial cKDTree query for any remaining missed texels
+    # Guarantees 100% full surface coverage while preventing ghosting/double projections
     final_missed = np.where(~hit_mask)[0]
     if len(final_missed) > 0:
-        print(f"[HighToLow Baker] Resolving {len(final_missed):,} crevice/boundary texels via fast spatial query...")
+        print(f"[HighToLow Baker] Resolving {len(final_missed):,} crevice/boundary texels via normal-aware spatial query...")
         sys.stdout.flush()
         from scipy.spatial import cKDTree
         kdtree = cKDTree(high_vtx)
-        _, nearest_idx = kdtree.query(p_low[final_missed], k=1, workers=-1)
+        k_val = min(16, len(high_vtx))
+        distances, nearest_idx = kdtree.query(p_low[final_missed], k=k_val, workers=-1)
 
-        hit_points[final_missed] = high_vtx[nearest_idx]
-        hit_normals[final_missed] = high_normals[nearest_idx]
+        if k_val > 1:
+            candidate_normals = high_normals[nearest_idx] # [N, K, 3]
+            dots = np.sum(candidate_normals * n_low[final_missed, None, :], axis=-1) # [N, K]
+            scores = dots - (distances * 5.0)
+            best_k = np.argmax(scores, axis=-1)
+            chosen_idx = nearest_idx[np.arange(len(final_missed)), best_k]
+        else:
+            chosen_idx = nearest_idx
+
+        hit_points[final_missed] = high_vtx[chosen_idx]
+        hit_normals[final_missed] = high_normals[chosen_idx]
         if has_high_uv:
-            hit_uvs[final_missed] = high_uvs[nearest_idx]
+            hit_uvs[final_missed] = high_uvs[chosen_idx]
         hit_mask[final_missed] = True
 
     # 100% of valid low-poly texels are now populated
@@ -620,12 +639,17 @@ def bake_high_to_low_poly(
     device_th = torch.device(device if torch.cuda.is_available() and device.startswith("cuda") else "cpu")
     mask_th = torch.from_numpy(dilated_mask).to(device_th)
 
-    def dilate_map(arr):
+    def dilate_map(arr, custom_mask=None):
+        m = custom_mask if custom_mask is not None else mask_th
         t = torch.from_numpy(arr).to(device_th)
-        t_dilated = fast_gpu_seam_dilate(t, mask_th, iterations=16)
+        t_dilated = fast_gpu_seam_dilate(t, m, iterations=16)
         return t_dilated.cpu().numpy()
 
-    out_diffuse = dilate_map(out_diffuse)
+    # For diffuse, filter out unprojected dark pixels (< 0.02) from the high-poly source
+    diff_valid = dilated_mask & (~(out_diffuse[..., :3] < 0.02).all(axis=-1))
+    diff_mask_th = torch.from_numpy(diff_valid).to(device_th)
+
+    out_diffuse = dilate_map(out_diffuse, custom_mask=diff_mask_th)
     out_normal = dilate_map(out_normal)
     out_roughness = dilate_map(out_roughness)
     out_metallic = dilate_map(out_metallic)
