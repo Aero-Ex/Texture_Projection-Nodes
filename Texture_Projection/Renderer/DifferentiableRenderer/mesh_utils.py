@@ -177,6 +177,12 @@ def save_glb_mesh(glb_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=
         
         visual = trimesh.visual.TextureVisuals(uv=uvs, material=pbr_mat)
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=visual, process=False)
+        mesh.fix_normals()
+        mesh.vertex_normals = trimesh.geometry.mean_vertex_normals(
+            vertex_count=len(vertices),
+            faces=faces,
+            face_normals=mesh.face_normals
+        )
         
         mesh.export(glb_path, file_type='glb')
         return os.path.exists(glb_path)
