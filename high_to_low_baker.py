@@ -105,14 +105,7 @@ def rasterize_lowpoly_uv_space(low_mesh, resolution, device="cuda"):
         vtx_uv = np.asarray(low_mesh.vertex_attributes.get('texcoord') or low_mesh.vertex_attributes.get('uv'), dtype=np.float32)
 
     if vtx_uv is None or len(vtx_uv) == 0:
-        print("[HighToLow Baker] Low-poly mesh missing UV coordinates, auto-unwrapping with xatlas...")
-        import xatlas
-        vmapping, indices, uvs = xatlas.parametrize(vtx_pos, faces)
-        vtx_pos = vtx_pos[vmapping]
-        faces = indices.astype(np.int32)
-        vtx_uv = uvs.astype(np.float32)
-        # Update low_mesh in place
-        low_mesh = trimesh.Trimesh(vertices=vtx_pos, faces=faces, visual=trimesh.visual.texture.TextureVisuals(uv=vtx_uv), process=False)
+        raise ValueError("Low-poly mesh is missing UV coordinates. Please provide a mesh with UV unwrapped coordinates.")
 
     uv_faces = faces
     normals = np.asarray(low_mesh.vertex_normals, dtype=np.float32)

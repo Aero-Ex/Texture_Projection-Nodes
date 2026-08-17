@@ -1,5 +1,5 @@
 import os
-import cv2
+from PIL import Image
 import math
 import numpy as np
 from io import StringIO
@@ -81,14 +81,16 @@ def _get_base_path_and_name(mesh_path: str) -> Tuple[str, str]:
     name = os.path.basename(base_path)
     return base_path, name
 
-def _save_texture_map(texture: np.ndarray, base_path: str, suffix: str = "", image_format: str = ".jpg", color_convert: Optional[int] = None) -> str:
+def _save_texture_map(texture: np.ndarray, base_path: str, suffix: str = "", image_format: str = ".jpg", as_grayscale: bool = False) -> str:
     path = f"{base_path}{suffix}{image_format}"
-    processed_texture = (texture * 255).astype(np.uint8)
-    if color_convert is not None:
-        processed_texture = cv2.cvtColor(processed_texture, color_convert)
-        cv2.imwrite(path, processed_texture)
+    processed_texture = (np.clip(texture, 0, 1) * 255).astype(np.uint8) if texture.dtype != np.uint8 else texture
+    if as_grayscale or (processed_texture.ndim == 3 and processed_texture.shape[-1] == 1):
+        if processed_texture.ndim == 3:
+            processed_texture = processed_texture.squeeze(-1)
+        img = Image.fromarray(processed_texture, mode="L")
     else:
-        cv2.imwrite(path, processed_texture[..., ::-1])  # RGB to BGR
+        img = Image.fromarray(processed_texture, mode="RGB")
+    img.save(path)
     return os.path.basename(path)
 
 def _write_mtl_properties(f, properties: Dict[str, Any]):
@@ -117,8 +119,8 @@ def save_obj_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic
     with open(mesh_path, "w") as f: f.write(obj_content)
     
     texture_maps = {"diffuse": _save_texture_map(texture, base_path)}
-    if metallic is not None: texture_maps["metallic"] = _save_texture_map(metallic, base_path, "_metallic", color_convert=cv2.COLOR_RGB2GRAY)
-    if roughness is not None: texture_maps["roughness"] = _save_texture_map(roughness, base_path, "_roughness", color_convert=cv2.COLOR_RGB2GRAY)
+    if metallic is not None: texture_maps["metallic"] = _save_texture_map(metallic, base_path, "_metallic", as_grayscale=True)
+    if roughness is not None: texture_maps["roughness"] = _save_texture_map(roughness, base_path, "_roughness", as_grayscale=True)
     if normal is not None: texture_maps["normal"] = _save_texture_map(normal, base_path, "_normal")
     
     with open(f"{base_path}.mtl", "w") as f:
