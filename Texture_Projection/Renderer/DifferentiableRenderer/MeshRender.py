@@ -6,7 +6,6 @@
 # components and must ensure that the usage of the third party components adheres to
 # all relevant laws and regulations.
 
-import cv2
 import torch
 import trimesh
 import numpy as np
@@ -210,17 +209,11 @@ class MeshRender:
         self.bake_mode = bake_mode
         self.shader_type = shader_type
         self.raster_mode = raster_mode
-        if self.raster_mode == "cr":
-            # Standalone path hack for custom_rasterizer
-            try:
-                import custom_rasterizer as cr
-            except ImportError:
-                temp_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                sys.path.append(os.path.join(temp_path, "custom_rasterizer"))
-                import custom_rasterizer as cr
-            self.raster = cr
-        else:
-            raise ValueError(f"No raster named {self.raster_mode}")
+        import nvdiffrast.torch as dr
+        try:
+            self.glctx = dr.RasterizeCudaContext(device=self.device)
+        except Exception:
+            self.glctx = dr.RasterizeGLContext() if hasattr(dr, 'RasterizeGLContext') else dr.RasterizeCudaContext()
         if camera_type == "orth":
             self.set_orth_scale(1.0)
         elif camera_type == "perspective":
@@ -310,24 +303,19 @@ class MeshRender:
         self.camera_proj_mat = get_orthographic_projection_matrix(left=-self.ortho_scale * 0.5, right=self.ortho_scale * 0.5, bottom=-self.ortho_scale * 0.5, top=self.ortho_scale * 0.5, near=0.1, far=100)
 
     def raster_rasterize(self, pos, tri, resolution, ranges=None, grad_db=True):
-        if self.raster_mode == "cr":
-            rast_out_db = None
-            if pos.dim() == 2: pos = pos.unsqueeze(0)
-            if pos.dtype == torch.float64: pos = pos.to(torch.float32)
-            if tri.dtype == torch.int64: tri = tri.to(torch.int32)
-            findices, barycentric = self.raster.rasterize(pos, tri, resolution)
-            rast_out = torch.cat((barycentric, findices.unsqueeze(-1)), dim=-1).unsqueeze(0)
-        else: raise ValueError(f"No raster named {self.raster_mode}")
+        if pos.dim() == 2: pos = pos.unsqueeze(0)
+        if pos.dtype == torch.float64: pos = pos.to(torch.float32)
+        if tri.dtype == torch.int64: tri = tri.to(torch.int32)
+        import nvdiffrast.torch as dr
+        rast_out, rast_out_db = dr.rasterize(self.glctx, pos, tri, resolution=resolution, ranges=ranges, grad_db=grad_db)
         return rast_out, rast_out_db
 
     def raster_interpolate(self, uv, rast_out, uv_idx):
-        if self.raster_mode == "cr":
-            textd = None
-            barycentric = rast_out[0, ..., :-1]
-            findices = rast_out[0, ..., -1]
-            if uv.dim() == 2: uv = uv.unsqueeze(0)
-            textc = self.raster.interpolate(uv, findices, barycentric, uv_idx)
-        else: raise ValueError(f"No raster named {self.raster_mode}")
+        if uv.dim() == 2: uv = uv.unsqueeze(0)
+        if uv.dtype == torch.float64: uv = uv.to(torch.float32)
+        if uv_idx.dtype == torch.int64: uv_idx = uv_idx.to(torch.int32)
+        import nvdiffrast.torch as dr
+        textc, textd = dr.interpolate(uv, rast_out, uv_idx)
         return textc, textd
 
     def raster_antialias(self, color, rast, pos, tri, topology_hash=None, pos_gradient_boost=1.0):
@@ -341,16 +329,21 @@ class MeshRender:
         self.set_mesh(vtx_pos, pos_idx, vtx_uv=vtx_uv, uv_idx=uv_idx, scale_factor=scale_factor, auto_center=auto_center)
         if texture_data is not None: self.set_texture(texture_data)
 
+    def _downsample_tex(self, tex):
+        if tex is None: return None
+        h, w = tex.shape[0] // 2, tex.shape[1] // 2
+        return np.array(Image.fromarray(tex).resize((w, h), Image.BILINEAR))
+
     def save_mesh(self, mesh_path, downsample=False):
         vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh(normalize=False)
         texture_data = self.get_texture()
         texture_metallic, texture_roughness = self.get_texture_mr()
         texture_normal = self.get_texture_normal()
         if downsample:
-            texture_data = cv2.resize(texture_data, (texture_data.shape[1]//2, texture_data.shape[0]//2))
-            if texture_metallic is not None: texture_metallic = cv2.resize(texture_metallic, (texture_metallic.shape[1]//2, texture_metallic.shape[0]//2))
-            if texture_roughness is not None: texture_roughness = cv2.resize(texture_roughness, (texture_roughness.shape[1]//2, texture_roughness.shape[0]//2))
-            if texture_normal is not None: texture_normal = cv2.resize(texture_normal, (texture_normal.shape[1]//2, texture_normal.shape[0]//2))
+            texture_data = self._downsample_tex(texture_data)
+            texture_metallic = self._downsample_tex(texture_metallic)
+            texture_roughness = self._downsample_tex(texture_roughness)
+            texture_normal = self._downsample_tex(texture_normal)
         save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture_data, metallic=texture_metallic, roughness=texture_roughness, normal=texture_normal)
 
     def save_glb(self, glb_path, downsample=False):
@@ -359,10 +352,10 @@ class MeshRender:
         texture_metallic, texture_roughness = self.get_texture_mr()
         texture_normal = self.get_texture_normal()
         if downsample:
-            texture_data = cv2.resize(texture_data, (texture_data.shape[1]//2, texture_data.shape[0]//2))
-            if texture_metallic is not None: texture_metallic = cv2.resize(texture_metallic, (texture_metallic.shape[1]//2, texture_metallic.shape[0]//2))
-            if texture_roughness is not None: texture_roughness = cv2.resize(texture_roughness, (texture_roughness.shape[1]//2, texture_roughness.shape[0]//2))
-            if texture_normal is not None: texture_normal = cv2.resize(texture_normal, (texture_normal.shape[1]//2, texture_normal.shape[0]//2))
+            texture_data = self._downsample_tex(texture_data)
+            texture_metallic = self._downsample_tex(texture_metallic)
+            texture_roughness = self._downsample_tex(texture_roughness)
+            texture_normal = self._downsample_tex(texture_normal)
         return save_glb_mesh(glb_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture_data, metallic=texture_metallic, roughness=texture_roughness, normal=texture_normal)
 
     def set_mesh(self, vtx_pos, pos_idx, vtx_uv=None, uv_idx=None, scale_factor=1.15, auto_center=True):
@@ -492,10 +485,20 @@ class MeshRender:
         return feat_map
 
     def render_sketch_from_depth(self, depth_image):
-        depth_image_np = (depth_image.cpu().numpy() * 255).astype(np.uint8)
-        depth_edges = cv2.Canny(depth_image_np, 30, 80)
-        sketch_image = torch.from_numpy(depth_edges).to(depth_image.device).float() / 255.0
-        return sketch_image.unsqueeze(-1)
+        # Native GPU Sobel edge detector
+        if depth_image.dim() == 2:
+            d = depth_image.unsqueeze(0).unsqueeze(0)
+        elif depth_image.dim() == 3:
+            d = depth_image.permute(2, 0, 1).unsqueeze(0)[:, :1]
+        else:
+            d = depth_image[:, :1]
+        gx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=depth_image.device, dtype=torch.float32).view(1, 1, 3, 3)
+        gy = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=depth_image.device, dtype=torch.float32).view(1, 1, 3, 3)
+        edge_x = F.conv2d(d, gx, padding=1)
+        edge_y = F.conv2d(d, gy, padding=1)
+        edge = torch.sqrt(edge_x ** 2 + edge_y ** 2).squeeze(0).squeeze(0)
+        sketch_image = (edge > 0.08).float().unsqueeze(-1)
+        return sketch_image
 
     def back_project(self, image, elev, azim, camera_distance=None, center=None, method=None):
         if isinstance(image, Image.Image): image = torch.tensor(np.array(image)/255.0)
