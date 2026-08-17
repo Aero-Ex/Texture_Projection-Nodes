@@ -1,3 +1,4 @@
-trimesh
-opencv-python
-ninja
+--extra-index-url https://pozzettiandrea.github.io/cuda-wheels
+trimesh<5.0.0,>=4.0.0
+pygltflib
+nvdiffrast
