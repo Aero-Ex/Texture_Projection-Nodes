@@ -1,4 +1,4 @@
-**Note:** This projection uses NVDiffrast for rasterization, baking, etc., which will be replaced by DRTK (MIT) in the future.
+**Note:** This projection uses NVDiffrast for rasterization, baking, etc., which will be replaced by DRTK (MIT) in the future.This project also uses third-party components with non-commercial license: Tencent Hunyuan3D-2.1 rendering code. and texkit code from [lumitex](https://github.com/LumiTexPBR/LumiTex).
 
 ### Troubleshooting
 
